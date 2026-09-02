@@ -5598,6 +5598,21 @@ async fn federation_endpoints_require_x_matrix_header() {
             backfill_path(room_id.as_str(), &[head.as_str()], Some(10)),
             None,
         ),
+        (
+            "POST",
+            FED_KEYS_QUERY.to_owned(),
+            Some(json!({ "device_keys": {} })),
+        ),
+        (
+            "POST",
+            FED_KEYS_CLAIM.to_owned(),
+            Some(json!({ "one_time_keys": {} })),
+        ),
+        (
+            "GET",
+            format!("/_matrix/federation/v1/user/devices/{}", alice()),
+            None,
+        ),
     ];
     for (method, path, body) in &cases {
         let (status, b) = fed_req(&router, method, path, body.as_ref(), None).await;
@@ -5734,4 +5749,298 @@ async fn invite_oob_rejects_forged_sender() {
             .is_some(),
         "honest OOB invite stub must be stored"
     );
+}
+
+// === E2EE key transport over federation ====================================
+//
+// On a phone mesh every device is its own homeserver, so a peer's keys are
+// always *remote* keys. These cover the three inbound routes a peer uses to
+// learn them, plus the `m.direct_to_device` EDU that carries the Megolm
+// session once a session can be opened.
+
+const FED_KEYS_QUERY: &str = "/_matrix/federation/v1/user/keys/query";
+const FED_KEYS_CLAIM: &str = "/_matrix/federation/v1/user/keys/claim";
+
+/// Upload one device (and optionally some one-time keys) through the
+/// client-server API, which is how a real client populates the directory the
+/// federation routes then serve.
+async fn upload_device(app: &axum::Router, user: &str, device: &str, one_time_keys: Value) {
+    let (status, _) = post_json(
+        app,
+        "/_matrix/client/v3/keys/upload",
+        &json!({
+            "device_keys": {
+                "user_id": user,
+                "device_id": device,
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                "keys": { format!("curve25519:{device}"): "curve", format!("ed25519:{device}"): "ed" },
+            },
+            "one_time_keys": one_time_keys,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "keys/upload");
+}
+
+/// Drive a federation transaction carrying EDUs and no PDUs.
+async fn send_edus(app: &axum::Router, txn_id: &str, edus: Value) -> StatusCode {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/_matrix/federation/v1/send/{txn_id}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "pdus": [], "edus": edus })).unwrap(),
+        ))
+        .unwrap();
+    drive(app, req).await.0
+}
+
+/// Everything currently sitting in the local to-device inbox, as a client sees
+/// it. `/sync` drains, so a second call returns nothing.
+async fn sync_to_device(app: &axum::Router) -> Vec<Value> {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_matrix/client/v3/sync?timeout=0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = drive(app, req).await;
+    assert_eq!(status, StatusCode::OK, "sync");
+    body.pointer("/to_device/events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn federation_keys_query_returns_a_local_users_devices() {
+    let (app, _tmp) = test_router().await;
+    upload_device(&app, alice().as_str(), "PHONE", json!({})).await;
+
+    let (status, body) = post_json(
+        &app,
+        FED_KEYS_QUERY,
+        &json!({ "device_keys": { alice().as_str(): [] } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["device_keys"][alice().as_str()]["PHONE"]["device_id"],
+        "PHONE"
+    );
+}
+
+#[tokio::test]
+async fn federation_keys_query_answers_only_for_our_own_users() {
+    // Answering for another server's user would let one node substitute keys
+    // for another's — the exact attack E2EE exists to stop.
+    let (app, _tmp) = test_router().await;
+    upload_device(&app, peer_user().as_str(), "THEIRS", json!({})).await;
+
+    let (status, body) = post_json(
+        &app,
+        FED_KEYS_QUERY,
+        &json!({ "device_keys": { peer_user().as_str(): [] } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["device_keys"], json!({}));
+}
+
+#[tokio::test]
+async fn federation_keys_query_honours_a_device_filter() {
+    let (app, _tmp) = test_router().await;
+    upload_device(&app, alice().as_str(), "PHONE", json!({})).await;
+    upload_device(&app, alice().as_str(), "LAPTOP", json!({})).await;
+
+    let (_, body) = post_json(
+        &app,
+        FED_KEYS_QUERY,
+        &json!({ "device_keys": { alice().as_str(): ["LAPTOP"] } }),
+    )
+    .await;
+
+    let devices = body["device_keys"][alice().as_str()].as_object().unwrap();
+    assert_eq!(devices.len(), 1, "only the requested device");
+    assert!(devices.contains_key("LAPTOP"));
+}
+
+#[tokio::test]
+async fn federation_keys_claim_hands_each_one_time_key_out_once() {
+    let (app, _tmp) = test_router().await;
+    upload_device(
+        &app,
+        alice().as_str(),
+        "PHONE",
+        json!({ "signed_curve25519:k1": { "key": "one" }, "signed_curve25519:k2": { "key": "two" } }),
+    )
+    .await;
+
+    let ask = json!({ "one_time_keys": { alice().as_str(): { "PHONE": "signed_curve25519" } } });
+    let mut handed_out = Vec::new();
+    for _ in 0..3 {
+        let (status, body) = post_json(&app, FED_KEYS_CLAIM, &ask).await;
+        assert_eq!(status, StatusCode::OK);
+        if let Some(keys) = body
+            .pointer(&format!("/one_time_keys/{}/PHONE", alice()))
+            .and_then(Value::as_object)
+        {
+            handed_out.extend(keys.keys().cloned());
+        }
+    }
+
+    // Two keys uploaded, two claims answered, the third empty — a one-time key
+    // handed out twice is not one-time.
+    assert_eq!(
+        handed_out,
+        vec!["signed_curve25519:k1", "signed_curve25519:k2"]
+    );
+}
+
+#[tokio::test]
+async fn federation_user_devices_lists_every_device() {
+    let (app, _tmp) = test_router().await;
+    upload_device(&app, alice().as_str(), "PHONE", json!({})).await;
+    upload_device(&app, alice().as_str(), "LAPTOP", json!({})).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/_matrix/federation/v1/user/devices/{}", alice()))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = drive(&app, req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], alice().as_str());
+    let mut ids: Vec<&str> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device_id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["LAPTOP", "PHONE"]);
+}
+
+#[tokio::test]
+async fn federation_user_devices_rejects_a_user_we_do_not_own() {
+    let (app, _tmp) = test_router().await;
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/_matrix/federation/v1/user/devices/{}",
+            peer_user()
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = drive(&app, req).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+#[tokio::test]
+async fn direct_to_device_edu_reaches_the_local_inbox() {
+    let (app, _tmp) = test_router().await;
+
+    let status = send_edus(
+        &app,
+        "edu-1",
+        json!([{
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": peer_user().as_str(),
+                "type": "m.room_key",
+                "message_id": "m1",
+                "messages": { alice().as_str(): { "PHONE": { "session_id": "S1" } } },
+            },
+        }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = sync_to_device(&app).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "m.room_key");
+    assert_eq!(events[0]["sender"], peer_user().as_str());
+    assert_eq!(events[0]["content"]["session_id"], "S1");
+
+    // `/sync` drains: a to-device message is delivered once.
+    assert!(sync_to_device(&app).await.is_empty());
+}
+
+#[tokio::test]
+async fn resent_transaction_does_not_deliver_the_edu_twice() {
+    let (app, _tmp) = test_router().await;
+    let edus = json!([{
+        "edu_type": "m.direct_to_device",
+        "content": {
+            "sender": peer_user().as_str(),
+            "type": "m.room_key",
+            "message_id": "m1",
+            "messages": { alice().as_str(): { "PHONE": { "session_id": "S1" } } },
+        },
+    }]);
+
+    assert_eq!(
+        send_edus(&app, "edu-dup", edus.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(send_edus(&app, "edu-dup", edus).await, StatusCode::OK);
+
+    // Whole-transaction dedup covers the EDU too: a peer retrying a
+    // transaction must not re-key the room.
+    assert_eq!(sync_to_device(&app).await.len(), 1);
+}
+
+#[tokio::test]
+async fn direct_to_device_edu_for_someone_elses_user_is_dropped() {
+    // We are not a router for another server's devices; relaying would let any
+    // peer inject to-device traffic under our origin.
+    let (app, _tmp) = test_router().await;
+
+    let status = send_edus(
+        &app,
+        "edu-2",
+        json!([{
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": peer_user().as_str(),
+                "type": "m.room_key",
+                "messages": { "@someone:third.example.org": { "*": { "session_id": "S1" } } },
+            },
+        }]),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(sync_to_device(&app).await.is_empty());
+}
+
+#[tokio::test]
+async fn unimplemented_edu_types_are_ignored() {
+    // Typing/presence/receipts still have no implementation; an EDU carrying
+    // one must not fail the transaction that also carries real work.
+    let (app, _tmp) = test_router().await;
+
+    let status = send_edus(
+        &app,
+        "edu-3",
+        json!([
+            { "edu_type": "m.typing", "content": { "user_id": peer_user().as_str(), "typing": true } },
+            {
+                "edu_type": "m.direct_to_device",
+                "content": {
+                    "sender": peer_user().as_str(),
+                    "type": "m.room_key",
+                    "messages": { alice().as_str(): { "*": { "session_id": "S1" } } },
+                },
+            },
+        ]),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sync_to_device(&app).await.len(), 1);
 }

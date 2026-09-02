@@ -73,7 +73,12 @@ impl KeyStore {
     }
 
     /// Merge uploaded one-time keys, keeping any already held.
-    fn put_one_time_keys(&mut self, user: &str, device: &str, keys: &serde_json::Map<String, Value>) {
+    fn put_one_time_keys(
+        &mut self,
+        user: &str,
+        device: &str,
+        keys: &serde_json::Map<String, Value>,
+    ) {
         let slot = self
             .one_time_keys
             .entry(user.to_owned())
@@ -104,6 +109,61 @@ impl KeyStore {
             }
         }
         counts
+    }
+
+    /// Device keys for an explicit `{user: [device_ids]}` request map. An
+    /// empty device list means every device of that user, per the spec; a user
+    /// we hold nothing for is absent from the answer rather than present and
+    /// empty, so a caller can tell "no such user" from "user with no devices".
+    fn device_keys_for(
+        &self,
+        requested: &serde_json::Map<String, Value>,
+    ) -> serde_json::Map<String, Value> {
+        let mut out = serde_json::Map::new();
+        for (user, wanted) in requested {
+            let Some(devices) = self.devices.get(user) else {
+                continue;
+            };
+            let filter = wanted.as_array().filter(|ids| !ids.is_empty());
+            let mut per_user = serde_json::Map::new();
+            for (device, keys) in devices {
+                let asked_for = filter
+                    .is_none_or(|ids| ids.iter().any(|id| id.as_str() == Some(device.as_str())));
+                if asked_for {
+                    per_user.insert(device.clone(), keys.clone());
+                }
+            }
+            out.insert(user.clone(), Value::Object(per_user));
+        }
+        out
+    }
+
+    /// Claim one one-time key per `{user: {device: algorithm}}` entry. Shared
+    /// by the client-server and federation `/keys/claim` handlers so a key can
+    /// never be handed to a local client and a remote peer both.
+    fn claim_for(
+        &mut self,
+        requested: &serde_json::Map<String, Value>,
+    ) -> serde_json::Map<String, Value> {
+        let mut claimed = serde_json::Map::new();
+        for (user, devices) in requested {
+            let Some(devices) = devices.as_object() else {
+                continue;
+            };
+            let mut per_device = serde_json::Map::new();
+            for (device, algorithm) in devices {
+                let Some(algorithm) = algorithm.as_str() else {
+                    continue;
+                };
+                if let Some((key_id, key)) = self.claim_one_time_key(user, device, algorithm) {
+                    per_device.insert(device.clone(), json!({ key_id: key }));
+                }
+            }
+            if !per_device.is_empty() {
+                claimed.insert(user.clone(), Value::Object(per_device));
+            }
+        }
+        claimed
     }
 
     /// Take one key of `algorithm` for a device, removing it. A one-time key
@@ -773,6 +833,18 @@ fn build_router(state: &AppState) -> Router {
             "/_matrix/federation/v2/send_leave/{room_id}/{event_id}",
             put(federation::send_leave::handle),
         )
+        .route(
+            "/_matrix/federation/v1/user/keys/query",
+            post(federation::keys::query),
+        )
+        .route(
+            "/_matrix/federation/v1/user/keys/claim",
+            post(federation::keys::claim),
+        )
+        .route(
+            "/_matrix/federation/v1/user/devices/{user_id}",
+            get(federation::keys::devices),
+        )
         .fallback(default_fallback)
         // Log one INFO line per request (method + path) and one per response
         // (status + latency), with 5xx surfaced at ERROR. We emit these under our
@@ -1310,79 +1382,191 @@ fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::respo
     (status, Json(json!({"errcode": errcode, "error": error}))).into_response()
 }
 
-async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
-    info!("Received query: {:?}", body.0);
-    let app = lock_app(&state.0);
-
-    // An empty device list for a user means "every device", per the spec.
-    let requested = body.pointer("/device_keys").and_then(Value::as_object);
-    let mut device_keys = serde_json::Map::new();
-    for (user, devices) in app.keys.devices.iter() {
-        let wanted = match requested {
-            Some(map) if !map.is_empty() => match map.get(user) {
-                Some(list) => list.as_array().is_none_or(|ids| {
-                    ids.is_empty() || ids.iter().any(|id| id.as_str() == Some(user.as_str()))
-                }),
-                None => false,
-            },
-            _ => true,
+/// Split a `{user: …}` request map into the users this node owns and the rest,
+/// grouped by the server that owns them. A user id that does not parse is
+/// dropped: there is no server to ask about it.
+fn split_by_server(
+    requested: &serde_json::Map<String, Value>,
+    our_name: &str,
+) -> (
+    serde_json::Map<String, Value>,
+    BTreeMap<ruma::OwnedServerName, serde_json::Map<String, Value>>,
+) {
+    let mut mine = serde_json::Map::new();
+    let mut theirs: BTreeMap<ruma::OwnedServerName, serde_json::Map<String, Value>> =
+        BTreeMap::new();
+    for (user, value) in requested {
+        let Ok(parsed) = ruma::OwnedUserId::try_from(user.as_str()) else {
+            continue;
         };
-        if !wanted {
+        if parsed.server_name().as_str() == our_name {
+            mine.insert(user.clone(), value.clone());
+        } else {
+            theirs
+                .entry(parsed.server_name().to_owned())
+                .or_default()
+                .insert(user.clone(), value.clone());
+        }
+    }
+    (mine, theirs)
+}
+
+/// Fold a peer's `{device_keys, master_keys, …}` answer into ours. Per-user
+/// entries are inserted whole: each server is the sole authority on its own
+/// users, so there is nothing to reconcile — and a peer that answered for a
+/// user it does not own is ignored by the sender, not merged here.
+fn merge_key_answer(into: &mut serde_json::Map<String, Value>, answer: Value) {
+    let Some(answer) = answer.as_object() else {
+        return;
+    };
+    for (section, users) in answer {
+        if section == "failures" {
             continue;
         }
-        let filter = requested
-            .and_then(|map| map.get(user))
-            .and_then(Value::as_array)
-            .filter(|ids| !ids.is_empty());
-        let mut out = serde_json::Map::new();
-        for (device, keys) in devices {
-            if filter.is_some_and(|ids| !ids.iter().any(|id| id.as_str() == Some(device.as_str()))) {
-                continue;
-            }
-            out.insert(device.clone(), keys.clone());
+        let Some(users) = users.as_object() else {
+            continue;
+        };
+        let slot = into
+            .entry(section.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(slot) = slot.as_object_mut() else {
+            continue;
+        };
+        for (user, value) in users {
+            slot.insert(user.clone(), value.clone());
         }
-        device_keys.insert(user.clone(), Value::Object(out));
     }
+}
 
-    let mut response = serde_json::Map::new();
-    response.insert("device_keys".to_owned(), Value::Object(device_keys));
-    for (key, value) in app.keys.cross_signing.iter() {
-        response.insert(key.clone(), value.clone());
+/// Answer with the device keys held for `device_keys`, asking the owning server
+/// for any user this node does not own.
+///
+/// The federation fan-out is what makes E2EE possible on a mesh: every phone is
+/// its own homeserver, so *every* other participant is a remote user and a
+/// purely local answer would always be empty. A peer we cannot reach lands in
+/// `failures` rather than failing the whole query — the client can still
+/// encrypt to everyone it did get keys for, and will retry the rest.
+async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+    info!("Received query: {:?}", body.0);
+    let (our_name, fed_client) = {
+        let app = lock_app(&state.0);
+        (app.config.server_name.clone(), app.fed_client.clone())
+    };
+
+    let requested = body
+        .pointer("/device_keys")
+        .and_then(Value::as_object)
+        .cloned()
+        .filter(|map| !map.is_empty());
+
+    // An absent or empty request map means "everything this node holds" — the
+    // shape the single-user dev client sends. It has no federated meaning
+    // (there is no peer to ask for "everyone"), so that path stays local.
+    let Some(requested) = requested else {
+        let app = lock_app(&state.0);
+        let all = app
+            .keys
+            .devices
+            .keys()
+            .map(|user| (user.clone(), Value::Array(Vec::new())))
+            .collect();
+        let device_keys = app.keys.device_keys_for(&all);
+        let mut response = serde_json::Map::new();
+        response.insert("device_keys".to_owned(), Value::Object(device_keys));
+        for (key, value) in app.keys.cross_signing.iter() {
+            response.insert(key.clone(), value.clone());
+        }
+        return Json(Value::Object(response));
+    };
+
+    let (mine, theirs) = split_by_server(&requested, &our_name);
+    let mut response = {
+        let app = lock_app(&state.0);
+        let device_keys = app.keys.device_keys_for(&mine);
+        let mut response = serde_json::Map::new();
+        response.insert("device_keys".to_owned(), Value::Object(device_keys));
+        for (key, value) in app.keys.cross_signing.iter() {
+            response.insert(key.clone(), value.clone());
+        }
+        response
+    };
+
+    let mut failures = serde_json::Map::new();
+    for (dest, ask) in theirs {
+        match fed_client.keys_query(&dest, &ask).await {
+            Ok(answer) => merge_key_answer(&mut response, answer),
+            Err(e) => {
+                warn!(%dest, error = %e, "federated /keys/query failed");
+                failures.insert(dest.to_string(), json!({ "message": e.to_string() }));
+            }
+        }
     }
+    response.insert("failures".to_owned(), Value::Object(failures));
     Json(Value::Object(response))
 }
 
 /// Queue to-device messages for their recipients. This is how a Megolm room
 /// key reaches the devices that need it: without it a client can claim a
 /// one-time key and still have nowhere to send the session it just built.
+///
+/// Recipients on other servers get the message as an `m.direct_to_device` EDU
+/// in a federation transaction. On a mesh that is the normal case, not the
+/// exception — the peer you are sharing a room key with is a different phone,
+/// which is a different homeserver.
 async fn send_to_device(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
-    axum::extract::Path((event_type, _txn_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((event_type, txn_id)): axum::extract::Path<(String, String)>,
     body: Json<Value>,
 ) -> Json<Value> {
-    let mut app = lock_app(&state.0);
+    let (our_name, fed_client) = {
+        let app = lock_app(&state.0);
+        (app.config.server_name.clone(), app.fed_client.clone())
+    };
     let messages = body
         .pointer("/messages")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let (mine, theirs) = split_by_server(&messages, &our_name);
 
-    for (user, devices) in messages {
-        let Some(devices) = devices.as_object() else {
-            continue;
-        };
-        // `*` means every device of that user, which is what a room-key share
-        // to a freshly-seen peer uses.
-        for content in devices.values() {
-            app.to_device
-                .entry(user.clone())
-                .or_default()
-                .push(json!({
+    {
+        let mut app = lock_app(&state.0);
+        for (user, devices) in &mine {
+            let Some(devices) = devices.as_object() else {
+                continue;
+            };
+            // `*` means every device of that user, which is what a room-key
+            // share to a freshly-seen peer uses.
+            for content in devices.values() {
+                app.to_device.entry(user.clone()).or_default().push(json!({
                     "type": event_type,
                     "sender": sender,
                     "content": content.clone(),
                 }));
+            }
+        }
+    }
+
+    // One EDU per destination server, carrying only that server's recipients.
+    // Fire-and-forget: the transaction is not queued in the durable outbox, so
+    // a peer that is out of range when a key is shared does not get it later.
+    // The client re-shares room keys on the next send to a device it has no
+    // session with, which is the recovery path for a dropped EDU — but this is
+    // the weakest link in the mesh E2EE story and the obvious next thing to
+    // make durable.
+    for (dest, recipients) in theirs {
+        let edu = json!({
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": sender,
+                "type": event_type,
+                "message_id": txn_id,
+                "messages": Value::Object(recipients),
+            },
+        });
+        if let Err(e) = fed_client.send_edu(&dest, &txn_id, &edu).await {
+            warn!(%dest, error = %e, "to-device EDU delivery failed");
         }
     }
 
@@ -1402,40 +1586,47 @@ pub(crate) fn drain_to_device(state: &AppState, user_id: &str) -> Vec<Value> {
 /// Hand out one one-time key per requested device so a peer can open an Olm
 /// session. Without this endpoint no client can encrypt to anyone, however
 /// complete its own crypto is.
+///
+/// Keys for our own users are popped locally; keys for anyone else are claimed
+/// from the server that owns them. A claim is destructive on whichever side
+/// serves it, so a request is never sent twice speculatively.
 async fn keys_claim(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received keys claim: {:?}", body.0);
-    let mut app = lock_app(&state.0);
+    let (our_name, fed_client) = {
+        let app = lock_app(&state.0);
+        (app.config.server_name.clone(), app.fed_client.clone())
+    };
 
-    let mut claimed = serde_json::Map::new();
     let requested = body
         .pointer("/one_time_keys")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let (mine, theirs) = split_by_server(&requested, &our_name);
 
-    for (user, devices) in requested {
-        let Some(devices) = devices.as_object() else {
-            continue;
-        };
-        let mut per_device = serde_json::Map::new();
-        for (device, algorithm) in devices {
-            let Some(algorithm) = algorithm.as_str() else {
-                continue;
-            };
-            if let Some((key_id, key)) = app.keys.claim_one_time_key(&user, device, algorithm) {
-                let mut one = serde_json::Map::new();
-                one.insert(key_id, key);
-                per_device.insert(device.clone(), Value::Object(one));
+    let mut claimed = {
+        let mut app = lock_app(&state.0);
+        app.keys.claim_for(&mine)
+    };
+
+    let mut failures = serde_json::Map::new();
+    for (dest, ask) in theirs {
+        match fed_client.keys_claim(&dest, &ask).await {
+            Ok(answer) => {
+                for (user, keys) in answer.as_object().into_iter().flatten() {
+                    claimed.insert(user.clone(), keys.clone());
+                }
             }
-        }
-        if !per_device.is_empty() {
-            claimed.insert(user, Value::Object(per_device));
+            Err(e) => {
+                warn!(%dest, error = %e, "federated /keys/claim failed");
+                failures.insert(dest.to_string(), json!({ "message": e.to_string() }));
+            }
         }
     }
 
     // `failures` is required by the spec even when empty; a client that cannot
     // find it treats the response as malformed.
-    Json(json!({ "one_time_keys": claimed, "failures": {} }))
+    Json(json!({ "one_time_keys": claimed, "failures": failures }))
 }
 
 async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {

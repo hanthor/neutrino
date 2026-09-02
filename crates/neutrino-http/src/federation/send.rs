@@ -74,10 +74,12 @@ pub(crate) struct TransactionBody {
     /// an empty transaction.
     #[serde(default)]
     pdus: Vec<Box<RawJsonValue>>,
-    /// EDUs are out of scope (no presence/typing/receipts/E2EE on this server).
-    /// Deserialized for shape validation, then dropped — stubbed per CLAUDE.md.
-    #[serde(default, rename = "edus")]
-    _edus: Vec<Box<RawJsonValue>>,
+    /// Ephemeral events. Only `m.direct_to_device` is acted on (it carries
+    /// Megolm room keys between devices, and on a mesh those devices are always
+    /// on different servers); presence, typing and receipts are still parsed
+    /// for shape and dropped.
+    #[serde(default)]
+    edus: Vec<Box<RawJsonValue>>,
     /// Anti-entropy: the sender's per-room forward extremities. Optional; a peer
     /// that has not implemented forward-extremity reconciliation omits it and the
     /// transaction behaves exactly as before. For each advertised room we hold,
@@ -167,6 +169,12 @@ pub(crate) async fn handle(
             forward_extremities: BTreeMap::new(),
         }));
     }
+
+    // EDUs. Handled here — past the whole-transaction dedup, before the PDUs —
+    // so a resent transaction does not deliver the same room key twice; an
+    // EDU-only transaction stages nothing, records itself as seen, and is
+    // therefore deduped by exactly the same path as one carrying events.
+    deliver_to_device(&state, &our_name, &body.edus);
 
     // Parse + dedup by event_id, then durably stage each PDU. A PDU that fails
     // `from_wire` is unkeyable (no derivable id) and cannot appear in the
@@ -353,4 +361,66 @@ pub(crate) async fn handle(
         pdus,
         forward_extremities,
     }))
+}
+
+/// Deposit the recipients of every `m.direct_to_device` EDU into the local
+/// to-device inboxes, ignoring EDU types this server does not implement.
+///
+/// This is the receiving half of mesh E2EE: the sending phone's homeserver PUT
+/// this transaction because the recipient is, from its point of view, a remote
+/// user. Messages addressed to users we do not own are dropped rather than
+/// relayed onward — we are not a router for someone else's devices, and
+/// forwarding would let any peer inject to-device traffic under our origin.
+fn deliver_to_device(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
+    use serde_json::{Value, json};
+
+    for raw in edus {
+        let Ok(edu) = serde_json::from_str::<Value>(raw.get()) else {
+            continue;
+        };
+        if edu.get("edu_type").and_then(Value::as_str) != Some("m.direct_to_device") {
+            continue;
+        }
+        let content = edu.get("content");
+        let sender = content
+            .and_then(|c| c.get("sender"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let event_type = content
+            .and_then(|c| c.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let messages = content
+            .and_then(|c| c.get("messages"))
+            .and_then(Value::as_object);
+        let Some(messages) = messages else {
+            continue;
+        };
+
+        let mut app = lock_app(state);
+        for (user, devices) in messages {
+            let ours = ruma::OwnedUserId::try_from(user.as_str())
+                .is_ok_and(|u| u.server_name().as_str() == our_name);
+            if !ours {
+                warn!(%user, "dropping to-device message for a user we do not own");
+                continue;
+            }
+            let Some(devices) = devices.as_object() else {
+                continue;
+            };
+            // Device targeting collapses to the user, matching the local inbox:
+            // login hands every device the same id, so the server cannot tell
+            // two of a user's devices apart yet. `*` (every device) and a named
+            // device therefore behave identically here.
+            for message in devices.values() {
+                app.to_device.entry(user.clone()).or_default().push(json!({
+                    "type": event_type,
+                    "sender": sender,
+                    "content": message.clone(),
+                }));
+            }
+        }
+    }
 }

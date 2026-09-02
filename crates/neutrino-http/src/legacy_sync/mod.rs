@@ -17,8 +17,8 @@ use axum::{
     response::IntoResponse,
 };
 use neutrino_store::{Membership, StorageBackend};
-use serde_json::Value;
 use ruma::{OwnedRoomId, OwnedUserId};
+use serde_json::Value;
 
 use crate::{AppState, error_response, lock_app};
 use crate::{

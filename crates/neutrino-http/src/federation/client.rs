@@ -218,6 +218,106 @@ impl FederationClient {
             .unwrap_or_default())
     }
 
+    /// `POST http://{dest}/_matrix/federation/v1/user/keys/query` — ask the
+    /// server that owns a set of users for their device keys. `requested` is
+    /// the `{user: [device_ids]}` map; the peer's whole answer object is
+    /// returned for the caller to merge.
+    pub(crate) async fn keys_query(
+        &self,
+        dest: &ServerName,
+        requested: &serde_json::Map<String, Value>,
+    ) -> Result<Value, FederationClientError> {
+        let url = format!(
+            "http://{}/_matrix/federation/v1/user/keys/query",
+            self.url_authority(dest)
+        );
+        info!(target: "neutrino_http", %dest, users = requested.len(), "outbound POST /_matrix/federation/v1/user/keys/query");
+        let resp = self
+            .http
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&serde_json::json!({ "device_keys": requested }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(non_2xx_error(resp, dest, "POST /user/keys/query").await);
+        }
+        Ok(resp.json::<Value>().await?)
+    }
+
+    /// `POST http://{dest}/_matrix/federation/v1/user/keys/claim` — take one
+    /// one-time key per requested remote device. Returns the peer's
+    /// `one_time_keys` map (absent or malformed becomes an empty object: a peer
+    /// with no keys left is a normal answer, not a transport failure).
+    pub(crate) async fn keys_claim(
+        &self,
+        dest: &ServerName,
+        requested: &serde_json::Map<String, Value>,
+    ) -> Result<Value, FederationClientError> {
+        let url = format!(
+            "http://{}/_matrix/federation/v1/user/keys/claim",
+            self.url_authority(dest)
+        );
+        info!(target: "neutrino_http", %dest, users = requested.len(), "outbound POST /_matrix/federation/v1/user/keys/claim");
+        let resp = self
+            .http
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&serde_json::json!({ "one_time_keys": requested }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(non_2xx_error(resp, dest, "POST /user/keys/claim").await);
+        }
+        let body = resp.json::<Value>().await?;
+        Ok(body
+            .get("one_time_keys")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())))
+    }
+
+    /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying one EDU
+    /// and no PDUs — the transport for `m.direct_to_device`.
+    ///
+    /// This bypasses the durable outbox (which stores PDUs, not EDUs), so
+    /// delivery is best-effort: a 4xx or an unreachable peer is logged and
+    /// dropped. That is a deliberate first step, not the end state — see the
+    /// caller in `lib.rs::send_to_device`.
+    pub(crate) async fn send_edu(
+        &self,
+        dest: &ServerName,
+        txn_id: &str,
+        edu: &Value,
+    ) -> Result<(), FederationClientError> {
+        let url = format!(
+            "http://{}/_matrix/federation/v1/send/{txn_id}",
+            self.url_authority(dest)
+        );
+        let edu = serde_json::value::to_raw_value(edu).map_err(|_| {
+            // An EDU we built ourselves from `serde_json::json!` always
+            // serializes; this arm is unreachable in practice.
+            FederationClientError::InvalidUrl
+        })?;
+        let edus = [edu];
+        let body = TransactionRequest {
+            pdus: &[],
+            edus: &edus,
+            forward_extremities: &BTreeMap::new(),
+        };
+        info!(target: "neutrino_http", %dest, txn = %txn_id, "outbound PUT /_matrix/federation/v1/send (edu)");
+        let resp = self
+            .http
+            .put(&url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(non_2xx_error(resp, dest, "PUT /send (edu)").await);
+        }
+        Ok(())
+    }
+
     /// `POST http://{dest}/_matrix/federation/v1/get_missing_events/{room_id}`
     /// to fetch ancestry between `earliest` (boundary already held) and
     /// `latest` (heads to walk back from), up to `limit` events. Returns the
