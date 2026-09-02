@@ -46,6 +46,84 @@ use federation::client::{FederationClient, ReqwestFetcher};
 use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
 
+/// The end-to-end encryption key directory.
+///
+/// Matrix keeps the cryptography in the client: a homeserver's whole job here
+/// is to remember which devices exist, hand out one one-time key per requested
+/// device so a peer can open an Olm session, and never hand the same one out
+/// twice. This is that, and no more.
+#[derive(Default)]
+struct KeyStore {
+    /// `device_keys[user][device] -> the uploaded device key object`.
+    devices: BTreeMap<String, BTreeMap<String, Value>>,
+    /// `one_time_keys[user][device][key_id] -> key`. Claiming removes.
+    one_time_keys: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
+    /// Cross-signing keys, merged as uploaded and echoed back on query.
+    cross_signing: serde_json::Map<String, Value>,
+}
+
+impl KeyStore {
+    /// Store a device's keys under the id the device actually claims, not a
+    /// fixed one: two devices of the same user must not overwrite each other.
+    fn put_device(&mut self, user: &str, device: &str, keys: Value) {
+        self.devices
+            .entry(user.to_owned())
+            .or_default()
+            .insert(device.to_owned(), keys);
+    }
+
+    /// Merge uploaded one-time keys, keeping any already held.
+    fn put_one_time_keys(&mut self, user: &str, device: &str, keys: &serde_json::Map<String, Value>) {
+        let slot = self
+            .one_time_keys
+            .entry(user.to_owned())
+            .or_default()
+            .entry(device.to_owned())
+            .or_default();
+        for (key_id, key) in keys {
+            slot.insert(key_id.clone(), key.clone());
+        }
+    }
+
+    /// Counts by algorithm, which is what `/keys/upload` answers with. The
+    /// client uses these to decide when to top the server up, so an invented
+    /// number means it either never replenishes or replenishes forever.
+    fn one_time_key_counts(&self, user: &str, device: &str) -> serde_json::Map<String, Value> {
+        let mut counts = serde_json::Map::new();
+        let held = self
+            .one_time_keys
+            .get(user)
+            .and_then(|devices| devices.get(device));
+        for key_id in held.into_iter().flat_map(|keys| keys.keys()) {
+            let algorithm = key_id.split_once(':').map_or(key_id.as_str(), |(a, _)| a);
+            let entry = counts
+                .entry(algorithm.to_owned())
+                .or_insert_with(|| Value::from(0u64));
+            if let Some(n) = entry.as_u64() {
+                *entry = Value::from(n + 1);
+            }
+        }
+        counts
+    }
+
+    /// Take one key of `algorithm` for a device, removing it. A one-time key
+    /// handed out twice is not one-time, so this is a pop and not a read.
+    fn claim_one_time_key(
+        &mut self,
+        user: &str,
+        device: &str,
+        algorithm: &str,
+    ) -> Option<(String, Value)> {
+        let keys = self.one_time_keys.get_mut(user)?.get_mut(device)?;
+        let key_id = keys
+            .keys()
+            .find(|id| id.split_once(':').is_some_and(|(a, _)| a == algorithm))
+            .cloned()?;
+        let key = keys.remove(&key_id)?;
+        Some((key_id, key))
+    }
+}
+
 struct App {
     store: Arc<SqliteStore>,
     /// Per-room state-machine actors. CSAPI writes go through here so they
@@ -74,7 +152,16 @@ struct App {
     /// erased `MissingEventsFetcher`, which exposes no `backfill` method.)
     fed_client: Arc<FederationClient>,
     sync_state: Arc<SyncState<SqliteStore>>,
-    keys: Option<Value>,
+    /// Device keys, one-time keys and cross-signing blobs, per user and device.
+    keys: KeyStore,
+    /// Undelivered to-device messages, per recipient user. Drained by `/sync`.
+    ///
+    /// Keyed by user rather than by device because login issues one device id
+    /// for everyone, so the server cannot yet tell two of a user's devices
+    /// apart. On a mesh node — one user, one phone — the two are the same
+    /// thing; on a multi-device account they are not, and this needs revisiting
+    /// when login stops handing out a fixed device id.
+    to_device: BTreeMap<String, Vec<Value>>,
     /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
     /// currently-visible peers here and the user-directory search handler reads
     /// it. Shared (`Arc`) so the host can hold a write handle while the router
@@ -303,7 +390,8 @@ impl AppState {
             fetcher,
             fed_client,
             sync_state,
-            keys: None,
+            keys: KeyStore::default(),
+            to_device: BTreeMap::new(),
             discovery,
             display_name_tx: None,
             policy,
@@ -565,6 +653,11 @@ fn build_router(state: &AppState) -> Router {
         .route("/_matrix/client/v3/sync", get(legacy_sync::handle))
         .route("/_matrix/client/v3/keys/query", post(keys_query))
         .route("/_matrix/client/v3/keys/upload", post(keys_upload))
+        .route("/_matrix/client/v3/keys/claim", post(keys_claim))
+        .route(
+            "/_matrix/client/v3/sendToDevice/{event_type}/{txn_id}",
+            put(send_to_device),
+        )
         .route(
             "/_matrix/client/v3/keys/device_signing/upload",
             post(device_signing_upload),
@@ -1219,18 +1312,130 @@ fn error_response(status: StatusCode, errcode: &str, error: &str) -> axum::respo
 
 async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     info!("Received query: {:?}", body.0);
+    let app = lock_app(&state.0);
 
-    if let Some(keys) = &lock_app(&state.0).keys {
-        info!(
-            "Returning stored keys: {}",
-            serde_json::to_string(&keys).unwrap_or_default()
-        );
-        Json(keys.clone())
-    } else {
-        Json(json!({
-            "device_keys": {},
-        }))
+    // An empty device list for a user means "every device", per the spec.
+    let requested = body.pointer("/device_keys").and_then(Value::as_object);
+    let mut device_keys = serde_json::Map::new();
+    for (user, devices) in app.keys.devices.iter() {
+        let wanted = match requested {
+            Some(map) if !map.is_empty() => match map.get(user) {
+                Some(list) => list.as_array().is_none_or(|ids| {
+                    ids.is_empty() || ids.iter().any(|id| id.as_str() == Some(user.as_str()))
+                }),
+                None => false,
+            },
+            _ => true,
+        };
+        if !wanted {
+            continue;
+        }
+        let filter = requested
+            .and_then(|map| map.get(user))
+            .and_then(Value::as_array)
+            .filter(|ids| !ids.is_empty());
+        let mut out = serde_json::Map::new();
+        for (device, keys) in devices {
+            if filter.is_some_and(|ids| !ids.iter().any(|id| id.as_str() == Some(device.as_str()))) {
+                continue;
+            }
+            out.insert(device.clone(), keys.clone());
+        }
+        device_keys.insert(user.clone(), Value::Object(out));
     }
+
+    let mut response = serde_json::Map::new();
+    response.insert("device_keys".to_owned(), Value::Object(device_keys));
+    for (key, value) in app.keys.cross_signing.iter() {
+        response.insert(key.clone(), value.clone());
+    }
+    Json(Value::Object(response))
+}
+
+/// Queue to-device messages for their recipients. This is how a Megolm room
+/// key reaches the devices that need it: without it a client can claim a
+/// one-time key and still have nowhere to send the session it just built.
+async fn send_to_device(
+    state: State<AppState>,
+    AuthUser(sender): AuthUser,
+    axum::extract::Path((event_type, _txn_id)): axum::extract::Path<(String, String)>,
+    body: Json<Value>,
+) -> Json<Value> {
+    let mut app = lock_app(&state.0);
+    let messages = body
+        .pointer("/messages")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for (user, devices) in messages {
+        let Some(devices) = devices.as_object() else {
+            continue;
+        };
+        // `*` means every device of that user, which is what a room-key share
+        // to a freshly-seen peer uses.
+        for content in devices.values() {
+            app.to_device
+                .entry(user.clone())
+                .or_default()
+                .push(json!({
+                    "type": event_type,
+                    "sender": sender,
+                    "content": content.clone(),
+                }));
+        }
+    }
+
+    Json(json!({}))
+}
+
+/// Take everything queued for a user, leaving the inbox empty. Matrix expects
+/// a to-device message to be delivered once; the client acknowledges by
+/// syncing again with the returned token.
+pub(crate) fn drain_to_device(state: &AppState, user_id: &str) -> Vec<Value> {
+    lock_app(state)
+        .to_device
+        .remove(user_id)
+        .unwrap_or_default()
+}
+
+/// Hand out one one-time key per requested device so a peer can open an Olm
+/// session. Without this endpoint no client can encrypt to anyone, however
+/// complete its own crypto is.
+async fn keys_claim(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+    info!("Received keys claim: {:?}", body.0);
+    let mut app = lock_app(&state.0);
+
+    let mut claimed = serde_json::Map::new();
+    let requested = body
+        .pointer("/one_time_keys")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for (user, devices) in requested {
+        let Some(devices) = devices.as_object() else {
+            continue;
+        };
+        let mut per_device = serde_json::Map::new();
+        for (device, algorithm) in devices {
+            let Some(algorithm) = algorithm.as_str() else {
+                continue;
+            };
+            if let Some((key_id, key)) = app.keys.claim_one_time_key(&user, device, algorithm) {
+                let mut one = serde_json::Map::new();
+                one.insert(key_id, key);
+                per_device.insert(device.clone(), Value::Object(one));
+            }
+        }
+        if !per_device.is_empty() {
+            claimed.insert(user, Value::Object(per_device));
+        }
+    }
+
+    // `failures` is required by the spec even when empty; a client that cannot
+    // find it treats the response as malformed.
+    Json(json!({ "one_time_keys": claimed, "failures": {} }))
 }
 
 async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
@@ -1238,23 +1443,31 @@ async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 
     let mut app = lock_app(&state.0);
     let body = body.0;
+    let fallback_user = app.config.user_id();
 
-    if app.keys.is_none()
-        && let Some(device_keys) = body.pointer("/device_keys")
-    {
-        let user_id = app.config.user_id();
-        app.keys = Some(json!({
-            "device_keys": {
-                user_id: { "DEVICEID": device_keys.clone() }
-            }
-        }));
+    // Trust the ids the device names for itself, falling back to this node's
+    // user and a conventional device id only when the upload omits them.
+    let device_keys = body.pointer("/device_keys");
+    let user = device_keys
+        .and_then(|k| k.get("user_id"))
+        .and_then(Value::as_str)
+        .unwrap_or(&fallback_user)
+        .to_owned();
+    let device = device_keys
+        .and_then(|k| k.get("device_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("DEVICEID")
+        .to_owned();
+
+    if let Some(keys) = device_keys {
+        app.keys.put_device(&user, &device, keys.clone());
+    }
+    if let Some(one_time) = body.pointer("/one_time_keys").and_then(Value::as_object) {
+        app.keys.put_one_time_keys(&user, &device, one_time);
     }
 
-    Json(json!({
-      "one_time_key_counts": {
-        "signed_curve25519": 100
-      }
-    }))
+    let counts = app.keys.one_time_key_counts(&user, &device);
+    Json(json!({ "one_time_key_counts": counts }))
 }
 
 async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
@@ -1265,14 +1478,13 @@ async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Jso
         obj.remove("auth");
     }
 
-    // Merge the (auth-stripped) cross-signing keys into the stored blob.
-    // No-op unless a prior `keys_upload` created `app.keys` as an object and
-    // the body is itself an object — a malformed body must not panic the
-    // stub handler.
-    if let Some(keys) = app.keys.as_mut().and_then(Value::as_object_mut)
-        && let Some(body_obj) = body.as_object()
-    {
-        keys.extend(body_obj.clone());
+    // Merge the (auth-stripped) cross-signing keys. They are echoed back
+    // alongside device keys on query; a malformed body is ignored rather than
+    // panicking the handler.
+    if let Some(body_obj) = body.as_object() {
+        for (key, value) in body_obj {
+            app.keys.cross_signing.insert(key.clone(), value.clone());
+        }
     }
 
     Json(json!({}))
@@ -1283,30 +1495,39 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     let mut app = lock_app(&state.0);
     let user_id = app.config.user_id();
 
-    // Extract the uploaded signatures map. Absent/malformed path → nothing to
-    // merge; return the stub without touching stored keys.
-    let sigs = body
-        .pointer(&format!("/{0}/DEVICEID/signatures/{0}", user_id))
-        .and_then(Value::as_object)
-        .cloned();
-
-    if let Some(sigs) = sigs
-        && let Some(keys) = &mut app.keys
-    {
-        info!(
-            "Adding signatures to stored keys {:?}",
-            serde_json::to_string(keys).unwrap_or_default()
-        );
-        if let Some(target) = keys
-            .pointer_mut(&format!(
-                "/device_keys/{0}/DEVICEID/signatures/{0}",
-                user_id
-            ))
-            .and_then(Value::as_object_mut)
-        {
-            target.extend(sigs);
+    // The body is `{user: {device: {signatures...}}}`. Merge each signature
+    // block into the stored device it signs; an absent device is skipped
+    // rather than created, since a signature over nothing means nothing.
+    let uploaded = body.0.as_object().cloned().unwrap_or_default();
+    for (user, devices) in uploaded {
+        let Some(devices) = devices.as_object() else {
+            continue;
+        };
+        for (device, signed) in devices {
+            let Some(sigs) = signed
+                .pointer(&format!("/signatures/{}", user))
+                .and_then(Value::as_object)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(stored) = app
+                .keys
+                .devices
+                .get_mut(&user)
+                .and_then(|d| d.get_mut(device))
+            else {
+                continue;
+            };
+            if let Some(target) = stored
+                .pointer_mut(&format!("/signatures/{}", user))
+                .and_then(Value::as_object_mut)
+            {
+                target.extend(sigs);
+            }
         }
     }
+    let _ = user_id;
 
     Json(json!({}))
 }

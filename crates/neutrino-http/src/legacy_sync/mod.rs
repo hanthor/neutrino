@@ -17,6 +17,7 @@ use axum::{
     response::IntoResponse,
 };
 use neutrino_store::{Membership, StorageBackend};
+use serde_json::Value;
 use ruma::{OwnedRoomId, OwnedUserId};
 
 use crate::{AppState, error_response, lock_app};
@@ -76,7 +77,15 @@ pub(crate) async fn handle(
 
     match resp {
         Ok(v5_resp) => {
-            let body = translate_response(v5_resp, &memberships);
+            let mut body = translate_response(v5_resp, &memberships);
+            // To-device messages ride out on the sync that follows them; the
+            // sliding-sync core does not carry them, so they are merged here.
+            let pending = crate::drain_to_device(&state.0, user_id.as_str());
+            if !pending.is_empty()
+                && let Some(slot) = body.pointer_mut("/to_device/events")
+            {
+                *slot = Value::Array(pending);
+            }
             (StatusCode::OK, Json(body)).into_response()
         }
         Err(SyncError::UnknownPos) => {
