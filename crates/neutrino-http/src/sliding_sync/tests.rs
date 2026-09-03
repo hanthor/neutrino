@@ -1594,44 +1594,138 @@ async fn too_many_lists_rejected() {
 }
 
 #[tokio::test]
-async fn e2ee_extension_echoed_when_enabled() {
+async fn e2ee_extension_reports_real_one_time_key_counts() {
     let (store, _tmp) = fresh_store().await;
     let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
+    // Nothing uploaded yet: an honest empty map, not a canned 100 that
+    // nothing could ever hand out.
     let mut req = Request::new();
     req.extensions.e2ee.enabled = Some(true);
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req.clone()).await.unwrap();
+    assert!(resp.extensions.e2ee.device_one_time_keys_count.is_empty());
+    assert_eq!(
+        resp.extensions.e2ee.device_unused_fallback_key_types,
+        Some(Vec::new()),
+        "no fallback keys are stored, so none are unused"
+    );
 
-    assert!(
-        !resp.extensions.e2ee.device_one_time_keys_count.is_empty(),
-        "OTK count populated"
-    );
-    assert!(
-        resp.extensions
-            .e2ee
-            .device_unused_fallback_key_types
-            .is_some()
-    );
+    // Two keys uploaded for the user's device: the count is two.
+    {
+        let mut inner = state.e2ee.lock();
+        inner
+            .keys
+            .put_device(user.as_str(), "PHONE", serde_json::json!({}));
+        let keys = serde_json::json!({
+            "signed_curve25519:k1": { "key": "one" },
+            "signed_curve25519:k2": { "key": "two" },
+        });
+        inner
+            .keys
+            .put_one_time_keys(user.as_str(), "PHONE", keys.as_object().unwrap());
+    }
+    let resp = handle(&state, user, req).await.unwrap();
+    let count = resp
+        .extensions
+        .e2ee
+        .device_one_time_keys_count
+        .get(&ruma::OneTimeKeyAlgorithm::SignedCurve25519)
+        .copied();
+    assert_eq!(count, Some(UInt::from(2u32)));
 }
 
 #[tokio::test]
-async fn to_device_extension_echoed_when_enabled() {
+async fn to_device_extension_delivers_and_drains_the_inbox() {
     let (store, _tmp) = fresh_store().await;
     let state = SyncState::new(store, no_shutdown());
     let user = user_id!("@alice:example.org");
 
+    state.e2ee.push_to_device(
+        user.as_str(),
+        "m.room_key",
+        "@bob:peer.example",
+        serde_json::json!({ "session_id": "S1" }),
+    );
+
     let mut req = Request::new();
     req.extensions.to_device.enabled = Some(true);
-    let resp = handle(&state, user, req).await.unwrap();
+    let resp = handle(&state, user, req.clone()).await.unwrap();
 
     let to_device = resp
         .extensions
         .to_device
         .as_ref()
-        .expect("to_device echo populated");
-    assert_eq!(to_device.next_batch, "0");
-    assert!(to_device.events.is_empty());
+        .expect("to_device populated");
+    assert_eq!(
+        to_device.next_batch, resp.pos,
+        "next_batch carries the pos token"
+    );
+    assert_eq!(to_device.events.len(), 1);
+    let event: Value = serde_json::from_str(to_device.events[0].json().get()).unwrap();
+    assert_eq!(event["type"], "m.room_key");
+    assert_eq!(event["sender"], "@bob:peer.example");
+    assert_eq!(event["content"]["session_id"], "S1");
+
+    // Delivered once: the next sync carries nothing.
+    req.pos = Some(resp.pos.clone());
+    req.timeout = Some(std::time::Duration::ZERO);
+    let resp = handle(&state, user, req).await.unwrap();
+    assert!(resp.extensions.to_device.unwrap().events.is_empty());
+}
+
+#[tokio::test]
+async fn to_device_message_wakes_a_long_poll() {
+    // The point of sharing the inbox with the sync path: a Megolm room key
+    // must reach the recipient now, not on the next unrelated room event.
+    let (store, _tmp) = fresh_store().await;
+    let state = Arc::new(SyncState::new(store, no_shutdown()));
+    let user = user_id!("@alice:example.org");
+
+    let mut req = Request::new();
+    req.extensions.to_device.enabled = Some(true);
+    let initial = handle(&state, user, req.clone()).await.unwrap();
+
+    req.pos = Some(initial.pos.clone());
+    req.timeout = Some(std::time::Duration::from_secs(10));
+    let poll = {
+        let state = state.clone();
+        tokio::spawn(async move { handle(&state, user, req).await })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    state.e2ee.push_to_device(
+        user.as_str(),
+        "m.room_key",
+        "@bob:peer.example",
+        serde_json::json!({ "session_id": "S1" }),
+    );
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(3), poll)
+        .await
+        .expect("long-poll woke on the to-device message")
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.extensions.to_device.unwrap().events.len(), 1);
+}
+
+#[tokio::test]
+async fn to_device_not_drained_when_extension_is_off() {
+    // A client that did not opt in must not lose messages to a drain nothing
+    // carried out.
+    let (store, _tmp) = fresh_store().await;
+    let state = SyncState::new(store, no_shutdown());
+    let user = user_id!("@alice:example.org");
+    state.e2ee.push_to_device(
+        user.as_str(),
+        "m.room_key",
+        "@bob:peer.example",
+        serde_json::json!({ "session_id": "S1" }),
+    );
+
+    let resp = handle(&state, user, Request::new()).await.unwrap();
+    assert!(resp.extensions.to_device.is_none());
+    assert_eq!(state.e2ee.pending_to_device(user.as_str()), 1);
 }
 
 #[tokio::test]

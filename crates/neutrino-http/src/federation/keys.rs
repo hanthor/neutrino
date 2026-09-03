@@ -6,7 +6,7 @@
 //! implementation and still never learn a single key belonging to the person
 //! sitting next to it. The client-server siblings in `lib.rs` answer for users
 //! this node owns; these answer the same questions for a peer that asks over
-//! federation, reading the same [`crate::KeyStore`].
+//! federation, reading the same [`crate::e2ee::KeyStore`].
 //!
 //! - `POST /_matrix/federation/v1/user/keys/query`
 //! - `POST /_matrix/federation/v1/user/keys/claim`
@@ -67,11 +67,12 @@ pub(crate) async fn query(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let app = lock_app(&state);
-    let device_keys = app.keys.device_keys_for(&ours(&requested, &our_name));
+    let e2ee = lock_app(&state).e2ee.clone();
+    let inner = e2ee.lock();
+    let device_keys = inner.keys.device_keys_for(&ours(&requested, &our_name));
     let mut response = Map::new();
     response.insert("device_keys".to_owned(), Value::Object(device_keys));
-    for (key, value) in app.keys.cross_signing.iter() {
+    for (key, value) in inner.keys.cross_signing.iter() {
         response.insert(key.clone(), value.clone());
     }
     Ok(Json(Value::Object(response)))
@@ -93,8 +94,8 @@ pub(crate) async fn claim(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut app = lock_app(&state);
-    let claimed = app.keys.claim_for(&ours(&requested, &our_name));
+    let e2ee = lock_app(&state).e2ee.clone();
+    let claimed = e2ee.lock().keys.claim_for(&ours(&requested, &our_name));
     Ok(Json(json!({ "one_time_keys": claimed })))
 }
 
@@ -120,8 +121,9 @@ pub(crate) async fn devices(
         return Err(FedError::BadRequest("user does not belong to this server"));
     }
 
-    let app = lock_app(&state);
-    let devices = app
+    let e2ee = lock_app(&state).e2ee.clone();
+    let inner = e2ee.lock();
+    let devices = inner
         .keys
         .devices
         .get(user.as_str())
@@ -138,11 +140,11 @@ pub(crate) async fn devices(
     // when the user has uploaded any.
     if let Some(object) = response.as_object_mut() {
         for name in ["master_key", "self_signing_key"] {
-            let uploaded = app
+            let uploaded = inner
                 .keys
                 .cross_signing
                 .get(&format!("{name}s"))
-                .or_else(|| app.keys.cross_signing.get(name));
+                .or_else(|| inner.keys.cross_signing.get(name));
             if let Some(value) = uploaded {
                 object.insert(name.to_owned(), value.clone());
             }

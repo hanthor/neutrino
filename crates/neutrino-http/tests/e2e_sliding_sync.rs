@@ -442,21 +442,44 @@ async fn invalid_conn_id_too_long_returns_m_invalid_param() {
 }
 
 #[tokio::test]
-async fn extension_e2ee_echoed_on_request() {
+async fn extension_e2ee_reports_the_real_one_time_key_count() {
     let (app, _tmp) = test_router().await;
 
-    let body = json!({
+    let sync = json!({
         "lists": {"all": {"ranges": [[0, 99]], "timeline_limit": 1, "required_state": []}},
         "extensions": {"e2ee": {"enabled": true}}
     });
-    let (status, body) = post(&app, SYNC_PATH, None, &body).await;
-    assert_eq!(status, StatusCode::OK);
 
+    // Nothing uploaded: honestly no count — ruma omits the empty map on the
+    // wire — rather than a canned number nothing could ever hand out.
+    let (status, body) = post(&app, SYNC_PATH, None, &sync).await;
+    assert_eq!(status, StatusCode::OK);
     let otk_count = body
         .pointer("/extensions/e2ee/device_one_time_keys_count")
         .and_then(|v| v.as_object())
-        .expect("e2ee echo populated");
-    assert!(!otk_count.is_empty(), "OTK count map present");
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        otk_count.is_empty(),
+        "no keys uploaded, so no count: {otk_count:?}"
+    );
+
+    // Upload two one-time keys for the local user's device; the count follows.
+    let upload = json!({
+        "device_keys": { "device_id": "PHONE", "keys": {} },
+        "one_time_keys": {
+            "signed_curve25519:k1": { "key": "one" },
+            "signed_curve25519:k2": { "key": "two" },
+        }
+    });
+    let (status, _) = post(&app, "/_matrix/client/v3/keys/upload", None, &upload).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = post(&app, SYNC_PATH, None, &sync).await;
+    assert_eq!(
+        body.pointer("/extensions/e2ee/device_one_time_keys_count/signed_curve25519"),
+        Some(&json!(2))
+    );
 }
 
 #[tokio::test]

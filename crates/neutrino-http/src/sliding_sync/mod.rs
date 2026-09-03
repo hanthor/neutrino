@@ -21,6 +21,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use neutrino_event::event_view::StateEventConversionError;
+
+use crate::e2ee::E2eeState;
 use neutrino_store::{StorageBackend, StorageError};
 use ruma::OneTimeKeyAlgorithm;
 use ruma::UInt;
@@ -102,6 +104,10 @@ pub enum SyncError {
 pub struct SyncState<S> {
     pub store: Arc<S>,
     pub registry: ConnRegistry,
+    /// The device-key directory and to-device inbox. Shared with the HTTP
+    /// handlers that fill it (`/keys/*`, `/sendToDevice`, inbound EDUs); the
+    /// long-poll watches it so a room key wakes the recipient.
+    pub e2ee: Arc<E2eeState>,
     /// Whether to synthesise delivery receipts from federation delivery marks
     /// (`Config::delivery_receipts`, off by default — see [`receipts`]). Set by
     /// the composition root; a client must *also* opt into the receipts
@@ -118,6 +124,7 @@ impl<S> SyncState<S> {
         Self {
             store,
             registry: ConnRegistry::new(),
+            e2ee: Arc::new(E2eeState::new()),
             delivery_receipts: false,
             shutdown,
         }
@@ -139,10 +146,11 @@ impl<S> SyncState<S> {
 /// 4. **Long-poll loop** — subscribe to the event watch BEFORE the first
 ///    build (TOCTOU per the trait docs), then iterate
 ///    build → has_data?-or-timeout?-or-cancelled? → `rx.changed()`.
-/// 5. **Extension stubs + idempotency cache write** — populate the
-///    e2ee/to_device echoes the client opted into, then snapshot the final
-///    response into `Conn::last_response` so any retry returns the same
-///    bytes.
+/// 5. **Extensions + idempotency cache write** — fill the e2ee/to_device
+///    extensions the client opted into (real key counts, the drained inbox),
+///    then snapshot the final response into `Conn::last_response` so any
+///    retry returns the same bytes — including the to-device events, which
+///    is what makes a drain safe against a lost response.
 pub async fn handle<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
@@ -213,6 +221,9 @@ pub async fn handle<S: StorageBackend>(
     // the event stream: a peer acknowledging an event we sent minutes ago is
     // new data for this client without any new event behind it.
     let mut delivery_rx = state.store.subscribe_deliveries();
+    // And the to-device inbox, which is neither: a room key arriving is new
+    // data for exactly this client and must not wait for a room event.
+    let mut e2ee_rx = state.e2ee.subscribe();
 
     // Short wait while the prior holder (if any) observes the cancel above
     // and unwinds.
@@ -261,7 +272,7 @@ pub async fn handle<S: StorageBackend>(
 
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
-        if !wait_for_data || has_data(&resp) {
+        if !wait_for_data || has_data(&resp) || has_to_device(state, user_id, &extensions_req) {
             break resp;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -292,6 +303,7 @@ pub async fn handle<S: StorageBackend>(
             tokio::select! {
                 _ = rx.changed() => {}
                 _ = delivery_rx.changed(), if state.delivery_receipts => {}
+                _ = e2ee_rx.changed(), if extensions_req.to_device.enabled == Some(true) => {}
             }
         };
         tokio::select! {
@@ -305,7 +317,7 @@ pub async fn handle<S: StorageBackend>(
         }
     };
 
-    populate_extension_stubs(&extensions_req, &mut final_resp);
+    populate_extensions(state, user_id, &extensions_req, &mut final_resp);
 
     // `build_response` chose `conn.pos + 1` as the response's pos_token but
     // didn't mutate `conn.pos` — commit the advance here, once per request,
@@ -411,53 +423,85 @@ fn clamp_timeout(req_timeout: Option<Duration>) -> Duration {
 ///
 /// **Today's definition is deliberately narrow: a non-empty `rooms`, or a
 /// receipts extension carrying at least one synthesised delivery receipt.**
-/// This is correct *only* for the current scope — the embedded server with
-/// stubbed extensions and no EDUs. The following signals do NOT cause this
-/// helper to return `true`, even though a fully-spec'd server would have to
-/// surface them on the wire:
+/// To-device messages are checked separately by [`has_to_device`], since they
+/// live outside the response until the drain at the end. The following
+/// signals do NOT cause this helper to return `true`, even though a
+/// fully-spec'd server would have to surface them on the wire:
 /// - **OTK / fallback-key changes** (`extensions.e2ee.device_one_time_keys_count`).
 /// - **Device-list changes** (`extensions.e2ee.device_lists`).
-/// - **New to-device messages** (`extensions.to_device.events`).
 /// - **Account-data updates** (`extensions.account_data.*`).
 /// - **Typing / presence** (and any real, federated receipt — the receipts
 ///   below are locally synthesised delivery marks, not EDUs).
 /// - **List `count` changes** (a room joining/leaving the candidate set
 ///   without otherwise being included in `resp.rooms`).
 ///
-/// Why it's safe right now: the e2ee/to_device extensions are pure echo
-/// stubs of the request, with constant payload — they never *independently*
-/// change between long-poll iterations, so waiting on them would be waiting
-/// forever. The other extensions are dropped entirely per CLAUDE.md.
-///
-/// If any of those signals ever gets a real implementation, this helper is
-/// the one place that needs to learn about them — or the loop will hold the
-/// connection open for events the response no longer reflects.
+/// Why it's safe right now: the key counts change only on the client's own
+/// upload or a peer's claim, and a client that just uploaded does not need
+/// waking to learn its own count. The other extensions are dropped entirely
+/// per CLAUDE.md. If any of those signals ever gets a real implementation,
+/// this helper is the one place that needs to learn about them — or the loop
+/// will hold the connection open for events the response no longer reflects.
 fn has_data(resp: &v5::Response) -> bool {
     !resp.rooms.is_empty() || !resp.extensions.receipts.rooms.is_empty()
 }
 
-/// Echo the e2ee / to_device extensions when the client opted in.
+/// Whether a to-device message waits for this client — only meaningful when
+/// the client opted into the extension, since otherwise nothing would carry
+/// it out and the loop would spin on data it can never return.
+fn has_to_device<S>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    req_ext: &v5::request::Extensions,
+) -> bool {
+    req_ext.to_device.enabled == Some(true) && state.e2ee.pending_to_device(user_id.as_str()) > 0
+}
+
+/// Fill the e2ee / to_device extensions the client opted into.
 ///
-/// The data is fake: we don't track device keys, one-time keys, or to-device
-/// messages. The point is *shape* — Element and similar clients abort if
-/// these fields are absent on a sync they opted in to. Matches the legacy
-/// `sync()` handler's stub semantics.
-fn populate_extension_stubs(req_ext: &v5::request::Extensions, resp: &mut v5::Response) {
+/// `to_device` **drains** the inbox: Matrix delivers a to-device message once,
+/// and the client acknowledges by syncing again with the returned `pos`. The
+/// drained events are part of the response that goes into the idempotency
+/// cache, so a client retrying a lost response gets them again rather than
+/// losing them. `next_batch` is required by the shape; the `pos` token is
+/// what actually orders this connection, so the field carries it.
+///
+/// `e2ee` reports the caller's real one-time key counts (see
+/// [`E2eeState::one_time_key_counts_for_user`] for the multi-device caveat)
+/// and, honestly, no unused fallback key types: fallback keys are not stored.
+/// `device_lists` stays empty — device-list updates are not implemented.
+fn populate_extensions<S>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    req_ext: &v5::request::Extensions,
+    resp: &mut v5::Response,
+) {
     if req_ext.e2ee.enabled == Some(true) {
         let mut e2ee = v5::response::E2EE::default();
-        // Constant "we have 100 OTKs of this type" stub. Real number tracking
-        // would require an OTK store, which is out of scope (CLAUDE.md).
-        e2ee.device_one_time_keys_count
-            .insert(OneTimeKeyAlgorithm::SignedCurve25519, UInt::from(100u32));
-        e2ee.device_unused_fallback_key_types = Some(vec![OneTimeKeyAlgorithm::SignedCurve25519]);
+        for (algorithm, count) in state.e2ee.one_time_key_counts_for_user(user_id.as_str()) {
+            let n = count.as_u64().unwrap_or(0);
+            e2ee.device_one_time_keys_count.insert(
+                OneTimeKeyAlgorithm::from(algorithm),
+                UInt::new_saturating(n),
+            );
+        }
+        e2ee.device_unused_fallback_key_types = Some(Vec::new());
         resp.extensions.e2ee = e2ee;
     }
     if req_ext.to_device.enabled == Some(true) {
         // ruma v5's response types are `#[non_exhaustive]`; build via Default
         // and field assignment rather than struct literal.
         let mut to_device = v5::response::ToDevice::default();
-        to_device.next_batch = "0".to_string();
-        to_device.events = Vec::<Raw<AnyToDeviceEvent>>::new();
+        to_device.next_batch = resp.pos.clone();
+        to_device.events = state
+            .e2ee
+            .drain_to_device(user_id.as_str())
+            .into_iter()
+            .filter_map(|event| {
+                serde_json::value::to_raw_value(&event)
+                    .ok()
+                    .map(Raw::<AnyToDeviceEvent>::from_json)
+            })
+            .collect();
         resp.extensions.to_device = Some(to_device);
     }
 }

@@ -1076,7 +1076,7 @@ mod tests {
         let tempfile = TempDir::new().unwrap();
         let store = Arc::new(SqliteStore::open_in_dir(tempfile.path()).await.unwrap());
         store
-            .enqueue_edu(&[dest.clone()], "k1", &room_key_edu("S1"))
+            .enqueue_edu(std::slice::from_ref(&dest), "k1", &room_key_edu("S1"))
             .await
             .unwrap();
 
@@ -1132,7 +1132,7 @@ mod tests {
         // Share the key while the peer cannot be reached; give the sender a
         // moment to fail and back off, and check nothing was lost.
         store
-            .enqueue_edu(&[dest.clone()], "k1", &room_key_edu("S1"))
+            .enqueue_edu(std::slice::from_ref(&dest), "k1", &room_key_edu("S1"))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1159,7 +1159,7 @@ mod tests {
         let dest = peer();
         let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 2).await;
         store
-            .enqueue_edu(&[dest.clone()], "k1", &room_key_edu("S1"))
+            .enqueue_edu(std::slice::from_ref(&dest), "k1", &room_key_edu("S1"))
             .await
             .unwrap();
 

@@ -372,7 +372,7 @@ pub(crate) async fn handle(
 /// relayed onward — we are not a router for someone else's devices, and
 /// forwarding would let any peer inject to-device traffic under our origin.
 fn deliver_to_device(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
     for raw in edus {
         let Ok(edu) = serde_json::from_str::<Value>(raw.get()) else {
@@ -399,7 +399,7 @@ fn deliver_to_device(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>
             continue;
         };
 
-        let mut app = lock_app(state);
+        let e2ee = lock_app(state).e2ee.clone();
         for (user, devices) in messages {
             let ours = ruma::OwnedUserId::try_from(user.as_str())
                 .is_ok_and(|u| u.server_name().as_str() == our_name);
@@ -415,11 +415,7 @@ fn deliver_to_device(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>
             // two of a user's devices apart yet. `*` (every device) and a named
             // device therefore behave identically here.
             for message in devices.values() {
-                app.to_device.entry(user.clone()).or_default().push(json!({
-                    "type": event_type,
-                    "sender": sender,
-                    "content": message.clone(),
-                }));
+                e2ee.push_to_device(user, &event_type, &sender, message.clone());
             }
         }
     }

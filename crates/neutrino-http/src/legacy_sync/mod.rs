@@ -80,7 +80,10 @@ pub(crate) async fn handle(
             let mut body = translate_response(v5_resp, &memberships);
             // To-device messages ride out on the sync that follows them; the
             // sliding-sync core does not carry them, so they are merged here.
-            let pending = crate::drain_to_device(&state.0, user_id.as_str());
+            let pending = lock_app(&state.0)
+                .e2ee
+                .clone()
+                .drain_to_device(user_id.as_str());
             if !pending.is_empty()
                 && let Some(slot) = body.pointer_mut("/to_device/events")
             {
