@@ -51,6 +51,46 @@ impl EventStore for SqliteStore {
         .await
     }
 
+    async fn redactions_of(
+        &self,
+        room_id: &RoomId,
+        ids: &[&EventId],
+    ) -> Result<Vec<Event>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let room_id = room_id.to_owned();
+        let ids: Vec<String> = ids.iter().map(|id| id.as_str().to_owned()).collect();
+        self.run_read(move |conn| -> Result<Vec<Event>, Error> {
+            // `redacts` lives in content from room version 11 on, which is
+            // every version this server speaks; json_extract reads it straight
+            // off the stored row, so a redaction needs no table of its own.
+            let placeholders = vec!["?"; ids.len()].join(",");
+            let query = format!(
+                "SELECT {EVENT_COLUMNS} FROM events \
+                 WHERE room_id = ? AND event_type = 'm.room.redaction' \
+                   AND rejected = 0 AND soft_failed = 0 \
+                   AND json_extract(json, '$.content.redacts') IN ({placeholders}) \
+                 ORDER BY stream_pos ASC"
+            );
+            let mut binds: Vec<&str> = Vec::with_capacity(ids.len() + 1);
+            binds.push(room_id.as_str());
+            for id in &ids {
+                binds.push(id.as_str());
+            }
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(params_from_iter(binds.iter()), |row| {
+                Ok(EventRow::try_from(row))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r??.into_event());
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn persist_historical_event(&self, event: &Event) -> Result<(), StorageError> {
         // event_id <-> raw consistency asserted inside `EventRow::from`.
         let event = EventRow::from(event).to_owned();

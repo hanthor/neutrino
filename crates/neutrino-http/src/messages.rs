@@ -272,8 +272,17 @@ pub(crate) async fn get_messages(
 
     // Order is exactly as room_messages returns it: `b` newest-first,
     // `f` oldest-first. No reversal (unlike sliding-sync).
-    let chunk: Vec<Raw<AnyTimelineEvent>> =
-        events.iter().map(Raw::<AnyTimelineEvent>::from).collect();
+    let redacted = match crate::redactions::applicable(&*store, &rid, &events).await {
+        Ok(map) => map,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    let chunk: Vec<Raw<AnyTimelineEvent>> = crate::redactions::timeline_views(&events, &redacted);
 
     let mut body: Map<String, Value> = Map::new();
     body.insert("chunk".to_string(), json!(chunk));

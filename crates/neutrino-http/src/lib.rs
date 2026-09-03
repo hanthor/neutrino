@@ -40,6 +40,7 @@ mod federation;
 mod legacy_sync;
 mod membership;
 mod messages;
+mod redactions;
 mod sliding_sync;
 
 #[cfg(feature = "multi-user-shim")]
@@ -674,6 +675,10 @@ fn build_router(state: &AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/unban",
             post(membership::unban),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
+            put(redact_event),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
@@ -2077,6 +2082,42 @@ async fn put_event(
     body: Json<Value>,
 ) -> axum::response::Response {
     send_via_actor(&state.0, sender, room_id, event_type, None, body.0).await
+}
+
+/// `PUT /rooms/{room}/redact/{eventId}/{txnId}` — delete a message, or take
+/// back a reaction. An `m.room.redaction` is an ordinary event through the
+/// room actor; what it does to its target happens on read (see
+/// [`redactions`]). Room v11+ carries `redacts` in content.
+async fn redact_event(
+    state: State<AppState>,
+    AuthUser(sender): AuthUser,
+    axum::extract::Path((room_id, event_id, _txn_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    if ruma::OwnedEventId::try_from(event_id.as_str()).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "invalid event id",
+        );
+    }
+    let mut content = json!({ "redacts": event_id });
+    if let Some(reason) = body.0.get("reason").and_then(Value::as_str) {
+        content["reason"] = Value::String(reason.to_owned());
+    }
+    send_via_actor(
+        &state.0,
+        sender,
+        room_id,
+        "m.room.redaction".to_owned(),
+        None,
+        content,
+    )
+    .await
 }
 
 /// `PUT /rooms/{room}/state/{type}/{stateKey}` — a state event.

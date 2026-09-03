@@ -6188,3 +6188,208 @@ async fn device_keys_one_time_keys_and_inbox_survive_a_restart() {
     })
     .await;
 }
+
+// === Redaction ===============================================================
+
+/// `GET /messages` newest-first, as the client sees it.
+async fn messages_of(app: &axum::Router, room_id: &str) -> Vec<Value> {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/_matrix/client/v3/rooms/{}/messages?dir=b&limit=50",
+            urlencoding(room_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = drive(app, req).await;
+    assert_eq!(status, StatusCode::OK, "messages: {body}");
+    body["chunk"].as_array().cloned().unwrap_or_default()
+}
+
+fn urlencoding(s: &str) -> String {
+    s.replace('!', "%21")
+        .replace(':', "%3A")
+        .replace('$', "%24")
+}
+
+async fn cs_put(app: &axum::Router, path: &str, body: &Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap();
+    drive(app, req).await
+}
+
+#[tokio::test]
+async fn author_can_redact_a_message_and_a_reaction() {
+    let (app, _tmp) = test_router().await;
+    let (_, created) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let (_, sent) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/t1",
+            urlencoding(&room_id)
+        ),
+        &json!({ "msgtype": "m.text", "body": "regrettable" }),
+    )
+    .await;
+    let message_id = sent["event_id"].as_str().unwrap().to_owned();
+    let (_, reacted) = cs_put(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{}/send/m.reaction/t2", urlencoding(&room_id)),
+        &json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": message_id, "key": "👍" } }),
+    )
+    .await;
+    let reaction_id = reacted["event_id"].as_str().unwrap().to_owned();
+
+    // Un-react, then delete the message, with a reason.
+    let (status, _) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/redact/{}/t3",
+            urlencoding(&room_id),
+            urlencoding(&reaction_id)
+        ),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, redaction) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/redact/{}/t4",
+            urlencoding(&room_id),
+            urlencoding(&message_id)
+        ),
+        &json!({ "reason": "typo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let redaction_id = redaction["event_id"].as_str().unwrap().to_owned();
+
+    let chunk = messages_of(&app, &room_id).await;
+    let by_id = |id: &str| chunk.iter().find(|e| e["event_id"] == id).cloned().unwrap();
+
+    // The message keeps its identity and loses its words; the client can see
+    // who deleted it and why.
+    let message = by_id(&message_id);
+    assert_eq!(message["type"], "m.room.message");
+    assert_eq!(message["content"], json!({}));
+    assert_eq!(
+        message["unsigned"]["redacted_because"]["event_id"],
+        redaction_id
+    );
+    assert_eq!(
+        message["unsigned"]["redacted_because"]["content"]["reason"],
+        "typo"
+    );
+    // The reaction's relation is gone with its content, which is what
+    // un-reacting means to a client aggregating annotations.
+    let reaction = by_id(&reaction_id);
+    assert_eq!(reaction["content"], json!({}));
+    // The redaction events themselves are ordinary timeline events.
+    let redaction = by_id(&redaction_id);
+    assert_eq!(redaction["type"], "m.room.redaction");
+    assert_eq!(redaction["content"]["redacts"], message_id);
+}
+
+#[tokio::test]
+async fn redaction_by_someone_without_power_changes_nothing() {
+    // A peer's redaction of Alice's message is stored and served as an
+    // event, and Alice's message stays intact: neither the author nor
+    // holding the room's redact level.
+    let (store, _tmp) = fresh_store().await;
+    let (room_id, join_id) = create_joined_room_in(&store, &alice(), 1).await;
+    let message = EventBuilder::new(
+        alice(),
+        "m.room.message".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "msgtype": "m.text", "body": "mine" }))
+    .prev_events(vec![join_id.clone()])
+    .prev_state_events(vec![join_id.clone()])
+    .origin_server_ts(2)
+    .build()
+    .unwrap();
+    store.persist_event(&message, &[]).await.unwrap();
+    let redaction = EventBuilder::new(
+        peer_user(),
+        "m.room.redaction".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .content(json!({ "redacts": message.event_id, "reason": "no" }))
+    .prev_events(vec![message.event_id.clone()])
+    .prev_state_events(vec![join_id.clone()])
+    .origin_server_ts(3)
+    .build()
+    .unwrap();
+    store.persist_event(&redaction, &[]).await.unwrap();
+
+    let app = router_with_store(config(), store.clone());
+    let chunk = messages_of(&app, room_id.as_str()).await;
+    let mine = chunk
+        .iter()
+        .find(|e| e["event_id"] == message.event_id.as_str())
+        .unwrap();
+    assert_eq!(mine["content"]["body"], "mine");
+    assert!(
+        mine.get("unsigned")
+            .and_then(|u| u.get("redacted_because"))
+            .is_none()
+    );
+    assert!(
+        chunk
+            .iter()
+            .any(|e| e["event_id"] == redaction.event_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn redacted_events_are_pruned_in_sliding_sync_too() {
+    let (app, _tmp) = test_router().await;
+    let (_, created) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let (_, sent) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/s1",
+            urlencoding(&room_id)
+        ),
+        &json!({ "msgtype": "m.text", "body": "gone soon" }),
+    )
+    .await;
+    let message_id = sent["event_id"].as_str().unwrap().to_owned();
+    cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/redact/{}/s2",
+            urlencoding(&room_id),
+            urlencoding(&message_id)
+        ),
+        &json!({}),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync",
+        &json!({ "lists": { "all": { "ranges": [[0, 9]], "timeline_limit": 10, "required_state": [] } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let timeline = body["rooms"][&room_id]["timeline"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let message = timeline
+        .iter()
+        .find(|e| e["event_id"] == message_id)
+        .expect("message in timeline");
+    assert_eq!(message["content"], json!({}));
+    assert!(message["unsigned"]["redacted_because"]["event_id"].is_string());
+}

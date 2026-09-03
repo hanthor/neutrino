@@ -4,9 +4,7 @@ use neutrino_store::{Direction, Event, Membership, StorageBackend, StreamPos};
 use ruma::UInt;
 use ruma::api::client::sync::sync_events::v5::response;
 use ruma::api::client::sync::sync_events::v5::{Request, Response};
-use ruma::events::{
-    AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
-};
+use ruma::events::{AnyStrippedStateEvent, AnySyncStateEvent, StateEventType};
 use ruma::serde::Raw;
 use ruma::{OwnedRoomId, RoomId, UserId};
 use serde_json::value::RawValue;
@@ -633,9 +631,9 @@ async fn build_room<S: StorageBackend>(
         (events, None, limited)
     };
 
-    let timeline_raw: Vec<Raw<AnySyncTimelineEvent>> =
-        timeline_events.iter().map(Into::into).collect();
-    room.timeline = timeline_raw;
+    // Redactions apply on read: prune whatever an allowed redaction targets.
+    let redacted = crate::redactions::applicable(&*state.store, room_id, &timeline_events).await?;
+    room.timeline = crate::redactions::sync_views(&timeline_events, &redacted);
     room.prev_batch = prev_batch_str;
     room.limited = limited;
     // `num_live`: MSC4186 = recent live events. Initial sync events are

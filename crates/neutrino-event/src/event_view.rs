@@ -15,6 +15,7 @@
 //! See `docs/event-view-conversions.md` for the rationale and the call-site
 //! migration plan.
 
+use ruma::canonical_json::CanonicalJsonObject;
 use ruma::events::{
     AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
 };
@@ -24,6 +25,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::Event;
+use crate::RoomVersion;
 
 /// Failure mode for the `TryFrom<&Event>` impls into state-shaped client
 /// views: an `Event` whose `state_key` is `None` cannot be represented as a
@@ -43,7 +45,7 @@ pub enum StateEventConversionError {
 /// `rooms.join.<id>.…`. `Always` is for the full-event endpoints where the
 /// event is delivered standalone (`/_matrix/client/v3/rooms/{}/event/{id}`).
 #[derive(Copy, Clone)]
-enum IncludeRoomId {
+pub enum IncludeRoomId {
     OnlyOnCreate,
     Always,
 }
@@ -70,6 +72,89 @@ fn enrich_for_client(ev: &Event, policy: IncludeRoomId) -> Box<RawValue> {
         }
     }
     to_raw_value(&Value::Object(obj)).expect("JSON object → RawValue is infallible")
+}
+
+/// A client view of `ev` after `because` (an `m.room.redaction`) has been
+/// applied: the room version's redaction rules prune everything but the keys
+/// the version keeps, and `unsigned.redacted_because` carries the redaction
+/// event so a client can show who deleted it and why. The event's own id,
+/// sender, type and timestamp survive, which is what lets a timeline keep its
+/// shape while the words are gone.
+///
+/// Redaction is applied on read rather than by rewriting the stored row: the
+/// DAG needs the original bytes for its hashes, and a redaction is itself an
+/// event that can arrive before or after its target over federation.
+pub fn redacted_for_client(
+    ev: &Event,
+    because: &Event,
+    version: &RoomVersion,
+    policy: IncludeRoomId,
+) -> Box<RawValue> {
+    let mut obj: CanonicalJsonObject = serde_json::from_str(ev.raw.get())
+        .expect("Event.raw is a JSON object by parse_event invariant");
+    // A failure here means the row violates the parse invariant (non-object
+    // content); fall back to the unredacted enrichment rather than panic a
+    // read path, since the alternative is a sync that never returns.
+    if crate::event_id::redact_for_hash(&mut obj, version).is_err() {
+        return enrich_for_client(ev, policy);
+    }
+    let mut obj: Map<String, Value> = serde_json::to_value(obj)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.insert("event_id".into(), Value::String(ev.event_id.to_string()));
+    let is_create = ev.event_type == "m.room.create";
+    match (policy, is_create) {
+        (IncludeRoomId::Always, _) | (IncludeRoomId::OnlyOnCreate, true) => {
+            obj.insert("room_id".into(), Value::String(ev.room_id.to_string()));
+        }
+        (IncludeRoomId::OnlyOnCreate, false) => {
+            obj.remove("room_id");
+        }
+    }
+    let because_json: Value =
+        serde_json::from_str(enrich_for_client(because, IncludeRoomId::Always).get())
+            .expect("enriched event is a JSON object");
+    let mut unsigned = Map::new();
+    unsigned.insert("redacted_because".into(), because_json);
+    obj.insert("unsigned".into(), Value::Object(unsigned));
+    to_raw_value(&Value::Object(obj)).expect("JSON object → RawValue is infallible")
+}
+
+/// The `/sync` timeline view of `ev`, redacted when `because` names the
+/// redaction that applies to it.
+pub fn sync_timeline_view(
+    ev: &Event,
+    because: Option<&Event>,
+    version: &RoomVersion,
+) -> Raw<AnySyncTimelineEvent> {
+    match because {
+        Some(because) => Raw::from_json(redacted_for_client(
+            ev,
+            because,
+            version,
+            IncludeRoomId::OnlyOnCreate,
+        )),
+        None => Raw::from(ev),
+    }
+}
+
+/// The standalone (`/messages`, `/event`) view of `ev`, redacted when
+/// `because` names the redaction that applies to it.
+pub fn timeline_view(
+    ev: &Event,
+    because: Option<&Event>,
+    version: &RoomVersion,
+) -> Raw<AnyTimelineEvent> {
+    match because {
+        Some(because) => Raw::from_json(redacted_for_client(
+            ev,
+            because,
+            version,
+            IncludeRoomId::Always,
+        )),
+        None => Raw::from(ev),
+    }
 }
 
 /// `/sync` `timeline.events` (v3) and v5 timeline. Both message and state

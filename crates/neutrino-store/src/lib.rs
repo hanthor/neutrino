@@ -205,6 +205,18 @@ pub trait EventStore: Send + Sync {
     ///       matching event are silently omitted (result length may be < `ids.len()`).
     async fn get_events(&self, ids: &[&EventId]) -> Result<Vec<Event>, StorageError>;
 
+    /// Pre:  none.
+    /// Post: every accepted (not rejected, not soft-failed) `m.room.redaction`
+    ///       event in `room_id` whose `content.redacts` names one of `ids`, in
+    ///       stream order. The caller decides whether each redaction is
+    ///       *allowed* to apply (sender or power level); the store only finds
+    ///       them. Empty `ids` returns empty without a query.
+    async fn redactions_of(
+        &self,
+        room_id: &RoomId,
+        ids: &[&EventId],
+    ) -> Result<Vec<Event>, StorageError>;
+
     /// Pre:  none (`StreamPos(0)` is valid for an initial full query).
     /// Post: returns all **client-visible** events with `stream_pos > pos` in
     ///       ascending stream order; returns an empty vec if no new events exist
