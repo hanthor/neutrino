@@ -5941,6 +5941,46 @@ async fn federation_user_devices_rejects_a_user_we_do_not_own() {
 }
 
 #[tokio::test]
+async fn send_to_device_for_a_remote_user_is_queued_durably() {
+    // The room key for a peer on another server goes into the federation
+    // outbox, keyed on the client's txn id, rather than being fired at the
+    // peer and forgotten: a phone out of BLE range at that second still gets
+    // it when the link heals. A client retry under the same txn id queues
+    // nothing new.
+    let (store, _tmp) = fresh_store().await;
+    let app = router_with_store(config(), store.clone());
+    let body = json!({ "messages": { peer_user().as_str(): { "*": { "session_id": "S1" } } } });
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/client/v3/sendToDevice/m.room_key/txn-1")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, _) = drive(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let dest: &ServerName = TEST_PEER.try_into().unwrap();
+    let queued = store.pending_edus(dest, usize::MAX).await.unwrap();
+    assert_eq!(
+        queued.len(),
+        1,
+        "one EDU per destination, retries coalesced"
+    );
+    let edu: Value = serde_json::from_str(queued[0].raw.get()).unwrap();
+    assert_eq!(edu["edu_type"], "m.direct_to_device");
+    assert_eq!(edu["content"]["type"], "m.room_key");
+    assert_eq!(edu["content"]["sender"], alice().as_str());
+    assert_eq!(
+        edu["content"]["messages"][peer_user().as_str()]["*"]["session_id"],
+        "S1"
+    );
+    // Nothing for the local inbox: the recipient is not ours.
+    assert!(sync_to_device(&app).await.is_empty());
+}
+
+#[tokio::test]
 async fn direct_to_device_edu_reaches_the_local_inbox() {
     let (app, _tmp) = test_router().await;
 

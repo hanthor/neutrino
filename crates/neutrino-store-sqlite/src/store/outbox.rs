@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use deadpool_sqlite::rusqlite::{params, params_from_iter};
-use neutrino_store::{Event, FederationOutbox, StorageError};
+use neutrino_store::{Event, FederationOutbox, OutboxEdu, StorageError};
 use ruma::{EventId, OwnedRoomId, OwnedServerName, RoomId, ServerName};
+use serde_json::value::RawValue as RawJsonValue;
 
 use crate::{
     SqliteStore,
@@ -15,7 +16,12 @@ use crate::{
 impl FederationOutbox for SqliteStore {
     async fn pending_destinations(&self) -> Result<Vec<OwnedServerName>, StorageError> {
         self.run_read(move |conn| -> Result<Vec<OwnedServerName>, Error> {
-            let mut stmt = conn.prepare("SELECT DISTINCT destination FROM outbox")?;
+            // PDUs and EDUs share one sender task per destination, so a peer
+            // owed only a to-device message must be enumerated too.
+            let mut stmt = conn.prepare(
+                "SELECT destination FROM outbox \
+                 UNION SELECT destination FROM outbox_edus",
+            )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
             let mut out = Vec::new();
@@ -26,6 +32,100 @@ impl FederationOutbox for SqliteStore {
                 out.push(server);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn enqueue_edu(
+        &self,
+        destinations: &[OwnedServerName],
+        edu_id: &str,
+        edu: &RawJsonValue,
+    ) -> Result<(), StorageError> {
+        if destinations.is_empty() {
+            return Ok(());
+        }
+        let destinations: Vec<String> =
+            destinations.iter().map(|d| d.as_str().to_owned()).collect();
+        let edu_id = edu_id.to_owned();
+        let edu = edu.get().to_owned();
+        let watch_tx = self.watch_tx.clone();
+
+        self.run_write(move |conn| -> Result<(), Error> {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO outbox_edus (destination, edu_id, edu) \
+                     VALUES (?, ?, ?)",
+                )?;
+                for dest in &destinations {
+                    stmt.execute(params![dest, edu_id, edu])?;
+                }
+            }
+            tx.commit()?;
+            // Not a room event, so the stream position stands; but the outbound
+            // supervisor idles on this watch and has to learn the destination
+            // has work.
+            SqliteStore::notify_watch_changed(&watch_tx);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn pending_edus(
+        &self,
+        destination: &ServerName,
+        limit: usize,
+    ) -> Result<Vec<OutboxEdu>, StorageError> {
+        let destination = destination.to_owned();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        self.run_read(move |conn| -> Result<Vec<OutboxEdu>, Error> {
+            let mut stmt = conn.prepare(
+                "SELECT edu_id, edu FROM outbox_edus \
+                 WHERE destination = ? \
+                 ORDER BY outbox_edu_id ASC \
+                 LIMIT ?",
+            )?;
+            let rows = stmt.query_map(params![destination.as_str(), limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            let mut out = Vec::new();
+            for r in rows {
+                let (edu_id, edu) = r?;
+                let raw = RawJsonValue::from_string(edu)
+                    .map_err(|e| Error::Internal(format!("malformed EDU in DB: {e}")))?;
+                out.push(OutboxEdu { edu_id, raw });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn remove_edus(
+        &self,
+        destination: &ServerName,
+        edu_ids: &[&str],
+    ) -> Result<(), StorageError> {
+        if edu_ids.is_empty() {
+            return Ok(());
+        }
+        let destination = destination.to_owned();
+        let edu_ids: Vec<String> = edu_ids.iter().map(|id| (*id).to_owned()).collect();
+
+        self.run_write(move |conn| -> Result<(), Error> {
+            let placeholders = vec!["?"; edu_ids.len()].join(",");
+            let query = format!(
+                "DELETE FROM outbox_edus WHERE destination = ? AND edu_id IN ({placeholders})"
+            );
+            let mut binds: Vec<&str> = Vec::with_capacity(edu_ids.len() + 1);
+            binds.push(destination.as_str());
+            for id in &edu_ids {
+                binds.push(id.as_str());
+            }
+            conn.execute(&query, params_from_iter(binds.iter()))?;
+            Ok(())
         })
         .await
     }
@@ -309,6 +409,110 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn to_device_edu(session: &str) -> Box<serde_json::value::RawValue> {
+        serde_json::value::to_raw_value(&serde_json::json!({
+            "edu_type": "m.direct_to_device",
+            "content": { "type": "m.room_key", "messages": { "@bob:b.example": { "*": { "session_id": session } } } },
+        }))
+        .unwrap()
+    }
+
+    // An EDU is queued once per destination, comes back in insertion order,
+    // and a destination owed only an EDU is enumerated by pending_destinations
+    // — otherwise a room key for an idle peer would sit in the table forever
+    // with no sender task to carry it.
+    #[tokio::test]
+    async fn edus_round_trip_per_destination() {
+        let s = store().await;
+        let dest_a = server_name!("a.example.com");
+        let dest_b = server_name!("b.example.com");
+
+        s.enqueue_edu(
+            &[dest_a.to_owned(), dest_b.to_owned()],
+            "k1",
+            &to_device_edu("S1"),
+        )
+        .await
+        .unwrap();
+        s.enqueue_edu(&[dest_a.to_owned()], "k2", &to_device_edu("S2"))
+            .await
+            .unwrap();
+
+        let mut dests = s.pending_destinations().await.unwrap();
+        dests.sort();
+        assert_eq!(
+            dests.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+            ["a.example.com", "b.example.com"]
+        );
+
+        let a = s.pending_edus(dest_a, usize::MAX).await.unwrap();
+        assert_eq!(
+            a.iter().map(|e| e.edu_id.as_str()).collect::<Vec<_>>(),
+            ["k1", "k2"]
+        );
+        assert!(a[0].raw.get().contains("\"S1\""));
+        assert_eq!(s.pending_edus(dest_a, 1).await.unwrap().len(), 1);
+        assert_eq!(s.pending_edus(dest_b, usize::MAX).await.unwrap().len(), 1);
+    }
+
+    // A retried enqueue under the same id is a no-op: the client's retry of
+    // /sendToDevice must not deliver the room key twice.
+    #[tokio::test]
+    async fn enqueue_edu_is_idempotent_per_id() {
+        let s = store().await;
+        let dest = server_name!("a.example.com");
+        s.enqueue_edu(&[dest.to_owned()], "k1", &to_device_edu("S1"))
+            .await
+            .unwrap();
+        s.enqueue_edu(&[dest.to_owned()], "k1", &to_device_edu("S1"))
+            .await
+            .unwrap();
+        assert_eq!(s.pending_edus(dest, usize::MAX).await.unwrap().len(), 1);
+    }
+
+    // remove_edus clears the named ids only, is idempotent, and once a
+    // destination has nothing left it drops out of pending_destinations.
+    #[tokio::test]
+    async fn remove_edus_clears_and_is_idempotent() {
+        let s = store().await;
+        let dest = server_name!("a.example.com");
+        s.enqueue_edu(&[dest.to_owned()], "k1", &to_device_edu("S1"))
+            .await
+            .unwrap();
+        s.enqueue_edu(&[dest.to_owned()], "k2", &to_device_edu("S2"))
+            .await
+            .unwrap();
+
+        s.remove_edus(dest, &["k1"]).await.unwrap();
+        let left = s.pending_edus(dest, usize::MAX).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].edu_id, "k2");
+
+        s.remove_edus(dest, &["k1", "k2"]).await.unwrap();
+        s.remove_edus(dest, &["k2"]).await.unwrap();
+        s.remove_edus(dest, &[]).await.unwrap();
+        assert!(s.pending_edus(dest, usize::MAX).await.unwrap().is_empty());
+        assert!(s.pending_destinations().await.unwrap().is_empty());
+    }
+
+    // Enqueueing an EDU wakes the store watch (so the idle sender task and
+    // supervisor notice) without moving the event stream position.
+    #[tokio::test]
+    async fn enqueue_edu_wakes_the_watch_without_advancing_it() {
+        let s = store().await;
+        let mut rx = s.subscribe();
+        let before = *rx.borrow_and_update();
+        s.enqueue_edu(
+            &[server_name!("a.example.com").to_owned()],
+            "k1",
+            &to_device_edu("S1"),
+        )
+        .await
+        .unwrap();
+        assert!(rx.has_changed().unwrap(), "watch was not woken");
+        assert_eq!(*rx.borrow_and_update(), before, "stream position moved");
     }
 
     // Anti-entropy: persist_resolved_event with `advertise_to` writes one

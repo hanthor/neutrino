@@ -486,14 +486,69 @@ pub trait StagingStore: Send + Sync {
     async fn unstage_events(&self, event_ids: &[&EventId]) -> Result<(), StorageError>;
 }
 
+/// An ephemeral event queued for federation delivery: the whole EDU object
+/// (`{edu_type, content}`) as it will appear in a transaction's `edus` array,
+/// and the id the sender removes it under once the peer has 2xx'd it.
+///
+/// EDUs carry no room, no DAG position and no event id, so they cannot ride
+/// the `events` table the way PDUs do; they are stored verbatim instead. The
+/// only EDU this server queues today is `m.direct_to_device`, which is how a
+/// Megolm room key crosses the mesh — and a room key that is dropped because
+/// the recipient was out of range for a second is a conversation that cannot
+/// be read, which is why these are durable and not fire-and-forget.
+#[derive(Debug, Clone)]
+pub struct OutboxEdu {
+    /// Caller-chosen id, unique per destination; a repeat enqueue under the
+    /// same id is a no-op, which is what makes a client's retried
+    /// `/sendToDevice` idempotent.
+    pub edu_id: String,
+    /// The EDU object, wire-verbatim.
+    pub raw: Box<RawJsonValue>,
+}
+
 #[async_trait]
 pub trait FederationOutbox: Send + Sync {
     /// Pre:  none.
     /// Post: returns the server names of every destination that has at least one outbox
-    ///       entry not yet removed via `remove_pdus`; callers should call `subscribe()`
+    ///       entry — a PDU not yet removed via `remove_pdus`, or an EDU not yet removed
+    ///       via `remove_edus`; callers should call `subscribe()`
     ///       *before* this on startup to avoid missing a destination added concurrently
     ///       (see `EventStore::subscribe` for the subscribe-before-query pattern).
     async fn pending_destinations(&self) -> Result<Vec<OwnedServerName>, StorageError>;
+
+    /// Pre:  `edu` is a complete EDU object (`{edu_type, content}`).
+    /// Post: one outbox row per destination in `destinations`, keyed
+    ///       `(destination, edu_id)`; a row that already exists is left alone
+    ///       (idempotent). Wakes `subscribe()` receivers without advancing the
+    ///       stream position — an EDU is not a room event — so the outbound
+    ///       sender notices a destination that was idle. An empty
+    ///       `destinations` slice writes nothing.
+    async fn enqueue_edu(
+        &self,
+        destinations: &[OwnedServerName],
+        edu_id: &str,
+        edu: &RawJsonValue,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none (returns empty vec if `destination` has no pending EDUs).
+    /// Post: returns up to `limit` of the oldest undelivered EDUs for
+    ///       `destination` in insertion order; does not remove them — the
+    ///       caller must call `remove_edus` after a successful `/send`.
+    async fn pending_edus(
+        &self,
+        destination: &ServerName,
+        limit: usize,
+    ) -> Result<Vec<OutboxEdu>, StorageError>;
+
+    /// Pre:  each id should have been returned by `pending_edus` for this
+    ///       `destination`; must only be called after the remote server
+    ///       returned a terminal status for the `/send` transaction carrying it.
+    /// Post: removes the matching `(destination, edu_id)` rows; idempotent.
+    async fn remove_edus(
+        &self,
+        destination: &ServerName,
+        edu_ids: &[&str],
+    ) -> Result<(), StorageError>;
 
     /// Pre:  none (returns empty vec if `destination` has no pending entries).
     /// Post: returns up to `limit` of the oldest undelivered PDUs for `destination` in

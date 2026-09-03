@@ -172,9 +172,9 @@ impl FederationClient {
     }
 
     /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying `pdus`
-    /// plus our `forward_extremities` advertisement (`edus` is omitted — EDUs
-    /// are out of scope; `origin`/`origin_server_ts` too — see
-    /// [`TransactionRequest`]). The per-PDU result map in the response
+    /// and `edus` plus our `forward_extremities` advertisement
+    /// (`origin`/`origin_server_ts` are omitted — see [`TransactionRequest`]).
+    /// The per-PDU result map in the response
     /// is ignored (the spec marks `error` advisory, and our durable retry lives in
     /// the outbox), but the response's `forward_extremities` (the peer's heads) is
     /// returned so the sender can reconcile against them. A response that omits or
@@ -185,6 +185,7 @@ impl FederationClient {
         dest: &ServerName,
         txn_id: &str,
         pdus: &[Box<RawJsonValue>],
+        edus: &[Box<RawJsonValue>],
         forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
     ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, FederationClientError> {
         // `txn_id` is locally generated (`{u64}-{u64}`) and `dest` is a
@@ -195,7 +196,7 @@ impl FederationClient {
         );
         let body = TransactionRequest {
             pdus,
-            edus: &[],
+            edus,
             forward_extremities,
         };
         let resp = self
@@ -274,48 +275,6 @@ impl FederationClient {
             .get("one_time_keys")
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new())))
-    }
-
-    /// `PUT http://{dest}/_matrix/federation/v1/send/{txn_id}` carrying one EDU
-    /// and no PDUs — the transport for `m.direct_to_device`.
-    ///
-    /// This bypasses the durable outbox (which stores PDUs, not EDUs), so
-    /// delivery is best-effort: a 4xx or an unreachable peer is logged and
-    /// dropped. That is a deliberate first step, not the end state — see the
-    /// caller in `lib.rs::send_to_device`.
-    pub(crate) async fn send_edu(
-        &self,
-        dest: &ServerName,
-        txn_id: &str,
-        edu: &Value,
-    ) -> Result<(), FederationClientError> {
-        let url = format!(
-            "http://{}/_matrix/federation/v1/send/{txn_id}",
-            self.url_authority(dest)
-        );
-        let edu = serde_json::value::to_raw_value(edu).map_err(|_| {
-            // An EDU we built ourselves from `serde_json::json!` always
-            // serializes; this arm is unreachable in practice.
-            FederationClientError::InvalidUrl
-        })?;
-        let edus = [edu];
-        let body = TransactionRequest {
-            pdus: &[],
-            edus: &edus,
-            forward_extremities: &BTreeMap::new(),
-        };
-        info!(target: "neutrino_http", %dest, txn = %txn_id, "outbound PUT /_matrix/federation/v1/send (edu)");
-        let resp = self
-            .http
-            .put(&url)
-            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(non_2xx_error(resp, dest, "PUT /send (edu)").await);
-        }
-        Ok(())
     }
 
     /// `POST http://{dest}/_matrix/federation/v1/get_missing_events/{room_id}`
@@ -730,9 +689,10 @@ impl FederationTransport for FederationClient {
         dest: &ServerName,
         txn_id: &str,
         pdus: &[Box<RawJsonValue>],
+        edus: &[Box<RawJsonValue>],
         forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
     ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
-        FederationClient::send_transaction(self, dest, txn_id, pdus, forward_extremities)
+        FederationClient::send_transaction(self, dest, txn_id, pdus, edus, forward_extremities)
             .await
             .map_err(TransportError::from)
     }
@@ -787,9 +747,9 @@ impl MissingEventsFetcher for ReqwestFetcher {
 #[derive(Serialize)]
 struct TransactionRequest<'a> {
     pdus: &'a [Box<RawJsonValue>],
-    /// EDUs are out of scope (see the crate root), so this is always empty in
-    /// practice — kept as a field so a future EDU sender has the plumbing.
-    /// Omitted when empty rather than sent as a `[]` nobody reads.
+    /// Ephemeral events queued for this destination — today only
+    /// `m.direct_to_device`. Omitted when empty rather than sent as a `[]`
+    /// nobody reads.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     edus: &'a [Box<RawJsonValue>],
     /// Anti-entropy: our per-room forward extremities. Omitted when empty so a
@@ -906,7 +866,7 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned(), None);
         let pdus = [raw(r#"{"n":1}"#), raw(r#"{"n":2}"#)];
         client
-            .send_transaction(&dest, "txn-1", &pdus, &BTreeMap::new())
+            .send_transaction(&dest, "txn-1", &pdus, &[], &BTreeMap::new())
             .await
             .unwrap();
 
@@ -937,7 +897,13 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned(), None);
         let pdu = raw("{}");
         let err = client
-            .send_transaction(&dest, "t", std::slice::from_ref(&pdu), &BTreeMap::new())
+            .send_transaction(
+                &dest,
+                "t",
+                std::slice::from_ref(&pdu),
+                &[],
+                &BTreeMap::new(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1120,7 +1086,13 @@ mod tests {
         let client = FederationClient::new("local.test".to_owned(), None);
         let pdu = raw("{}");
         let err = client
-            .send_transaction(&dest, "t", std::slice::from_ref(&pdu), &BTreeMap::new())
+            .send_transaction(
+                &dest,
+                "t",
+                std::slice::from_ref(&pdu),
+                &[],
+                &BTreeMap::new(),
+            )
             .await
             .unwrap_err();
         assert!(

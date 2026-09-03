@@ -61,13 +61,15 @@ pub struct MissingEventsQuery<'a> {
 /// engine is oblivious to it.
 #[async_trait::async_trait]
 pub trait FederationTransport: Send + Sync {
-    /// `PUT /_matrix/federation/v1/send/{txn_id}`. Returns each room's
-    /// post-transaction forward extremities as reported by the peer.
+    /// `PUT /_matrix/federation/v1/send/{txn_id}` carrying `pdus` and `edus`.
+    /// Returns each room's post-transaction forward extremities as reported by
+    /// the peer.
     async fn send_transaction(
         &self,
         dest: &ServerName,
         txn_id: &str,
         pdus: &[Box<RawJsonValue>],
+        edus: &[Box<RawJsonValue>],
         forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
     ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError>;
 }

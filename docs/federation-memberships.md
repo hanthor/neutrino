@@ -25,7 +25,9 @@ Hard constraints from CLAUDE.md / project shape:
 - **X-Matrix auth required** on inbound federation endpoints — network-attested
   origin (no key/sig), matching `/send`, `/backfill`, `/get_missing_events`. See
   `crates/neutrino-http/src/federation/auth.rs`.
-- **No EDUs / E2EE / pagination / rate-limiting / access control.**
+- **No EDUs other than `m.direct_to_device` / no pagination / rate-limiting / access control.**
+  The E2EE key surface (`/user/keys/query`, `/user/keys/claim`, `/user/devices`)
+  lives in `crates/neutrino-http/src/federation/keys.rs`.
 - **Restricted rooms are out of scope** (`join_authorised_via_users_server`,
   `M_UNABLE_TO_AUTHORISE_JOIN`, `M_UNABLE_TO_GRANT_JOIN`). Public + invite join rules
   only. Document the gap; do not implement.

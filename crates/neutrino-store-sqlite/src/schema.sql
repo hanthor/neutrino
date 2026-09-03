@@ -290,6 +290,25 @@ CREATE TABLE outbox (
 CREATE INDEX ix_outbox_dest_order ON outbox(destination, outbox_id);
 
 -- ----------------------------------------------------------------------------
+-- outbox_edus — FederationOutbox (EDU half)
+-- Ephemeral events queued for a destination, stored verbatim: an EDU has no
+-- event_id and no row in `events` to reference, so unlike `outbox` this table
+-- carries the body. outbox_edu_id is insertion order (pending_edus). UNIQUE
+-- (destination, edu_id) makes a retried enqueue a no-op — the caller's id is
+-- the client's /sendToDevice transaction id, so a client retry is idempotent.
+-- AUTOINCREMENT requires a rowid alias → no WITHOUT ROWID.
+-- ----------------------------------------------------------------------------
+CREATE TABLE outbox_edus (
+    outbox_edu_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    destination    TEXT NOT NULL,
+    edu_id         TEXT NOT NULL,
+    edu            TEXT NOT NULL,
+    UNIQUE (destination, edu_id)
+) STRICT;
+
+CREATE INDEX ix_outbox_edus_dest_order ON outbox_edus(destination, outbox_edu_id);
+
+-- ----------------------------------------------------------------------------
 -- deliveries — DeliveryStore
 -- The newest event of a room a destination has acknowledged receiving (2xx'd
 -- the /send transaction carrying it). A high-water mark, so exactly one row per

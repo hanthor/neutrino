@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 /// transaction carrying more than this; the outbound sender chunks to it. One
 /// constant so the two halves can't drift.
 pub const MAX_PDUS_PER_TXN: usize = 50;
+/// Spec cap on `edus` per transaction. A to-device batch is small anyway — a
+/// room-key share is one EDU per recipient server — so this is a ceiling, not
+/// a target.
+pub const MAX_EDUS_PER_TXN: usize = 100;
 
 /// Backoff floor after a transient failure (outbound delivery, inbound
 /// staging). Shared so the two retry loops can't drift.

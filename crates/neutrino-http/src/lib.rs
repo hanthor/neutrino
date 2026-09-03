@@ -18,7 +18,7 @@ use neutrino_event::{Event, EventPolicy, FormatError};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
-use neutrino_store::{IdentityStore, RoomStore, StateStore, StorageError};
+use neutrino_store::{FederationOutbox, IdentityStore, RoomStore, StateStore, StorageError};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::events::AnyTimelineEvent;
@@ -1510,18 +1510,20 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 /// one-time key and still have nowhere to send the session it just built.
 ///
 /// Recipients on other servers get the message as an `m.direct_to_device` EDU
-/// in a federation transaction. On a mesh that is the normal case, not the
-/// exception — the peer you are sharing a room key with is a different phone,
-/// which is a different homeserver.
+/// through the durable federation outbox, so a peer that is out of range when
+/// a key is shared receives it when the link heals. On a mesh that is the
+/// normal case, not the exception — the peer you are sharing a room key with is
+/// a different phone, which is a different homeserver, and BLE range comes and
+/// goes.
 async fn send_to_device(
     state: State<AppState>,
     AuthUser(sender): AuthUser,
     axum::extract::Path((event_type, txn_id)): axum::extract::Path<(String, String)>,
     body: Json<Value>,
-) -> Json<Value> {
-    let (our_name, fed_client) = {
+) -> axum::response::Response {
+    let (our_name, store) = {
         let app = lock_app(&state.0);
-        (app.config.server_name.clone(), app.fed_client.clone())
+        (app.config.server_name.clone(), app.store.clone())
     };
     let messages = body
         .pointer("/messages")
@@ -1549,28 +1551,36 @@ async fn send_to_device(
     }
 
     // One EDU per destination server, carrying only that server's recipients.
-    // Fire-and-forget: the transaction is not queued in the durable outbox, so
-    // a peer that is out of range when a key is shared does not get it later.
-    // The client re-shares room keys on the next send to a device it has no
-    // session with, which is the recovery path for a dropped EDU — but this is
-    // the weakest link in the mesh E2EE story and the obvious next thing to
-    // make durable.
+    // The outbox row is keyed on the client's transaction id, so a client that
+    // retries this request after a lost response does not queue the key twice;
+    // `message_id` carries the same id to the peer for its own dedup.
     for (dest, recipients) in theirs {
+        let edu_id = format!("{sender}/{txn_id}");
         let edu = json!({
             "edu_type": "m.direct_to_device",
             "content": {
                 "sender": sender,
                 "type": event_type,
-                "message_id": txn_id,
+                "message_id": edu_id,
                 "messages": Value::Object(recipients),
             },
         });
-        if let Err(e) = fed_client.send_edu(&dest, &txn_id, &edu).await {
-            warn!(%dest, error = %e, "to-device EDU delivery failed");
+        let raw = serde_json::value::to_raw_value(&edu)
+            .expect("an EDU built from json! always serializes");
+        if let Err(e) = store
+            .enqueue_edu(std::slice::from_ref(&dest), &edu_id, &raw)
+            .await
+        {
+            warn!(%dest, error = %e, "queueing to-device EDU");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                "could not queue the message for federation",
+            );
         }
     }
 
-    Json(json!({}))
+    Json(json!({})).into_response()
 }
 
 /// Take everything queued for a user, leaving the inbox empty. Matrix expects

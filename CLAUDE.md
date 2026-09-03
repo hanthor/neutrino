@@ -2,7 +2,7 @@
 
 The project is a minimal rust-based Matrix homeserver which will be embedded into an Android device using UniFFI. The server is only capable of sending and receiving message / state events, meaning this project only implements a subset of the Matrix specification. The specification targeted is https://spec.matrix.org/v1.18/ - strictly only the Client-Server API and Server-Server API.
 
-The server only targets room version 12, along with MSC4242: State DAGs https://github.com/matrix-org/matrix-spec-proposals/pull/4242 . This means the Server-Server API does not need to implement /event_auth, /state or /state_ids. EDUs and End-to-End encryption are NOT implemented, but MUST be stubbed out at the HTTP handler layer to ensure the client application functions correctly. Ruma https://github.com/ruma/ruma MUST be used. The homeserver will be running in either a trusted or untrusted network. The Client-Server API is never exposed on the network, it’s entirely embedded in the mobile device. As such, there is no need to make the Client-Server API performant or have any kind of access control. Registration and Login should be stubbed out.
+The server only targets room version 12, along with MSC4242: State DAGs https://github.com/matrix-org/matrix-spec-proposals/pull/4242 . This means the Server-Server API does not need to implement /event_auth, /state or /state_ids. End-to-End encryption is implemented only as far as the server's role in it goes — a device-key directory, one-time key claims and to-device messages, over both the Client-Server and Server-Server APIs — because the cryptography itself lives in the client. Of the EDUs only `m.direct_to_device` is implemented (it is how a Megolm room key crosses federation, and rides the durable outbox like a PDU); presence, typing and receipts are NOT implemented and MUST be stubbed out at the HTTP handler layer to ensure the client application functions correctly. Ruma https://github.com/ruma/ruma MUST be used. The homeserver will be running in either a trusted or untrusted network. The Client-Server API is never exposed on the network, it’s entirely embedded in the mobile device. As such, there is no need to make the Client-Server API performant or have any kind of access control. Registration and Login should be stubbed out.
 
 ## stack
 - axum (routing + handlers)
@@ -164,7 +164,7 @@ Procedure:
        rules, event auth rules, wire/PDU format, redaction algorithm, state-res
        steps, M_* error codes. Flag behaviour that is plausible but not what the
        spec mandates, AND anything implemented that the spec doesn't require
-       (over-implementation). Out-of-scope per this file (signatures, EDUs, E2EE,
+       (over-implementation). Out-of-scope per this file (signatures, non-to-device EDUs,
        pagination, auth): note if the diff touches them, don't review them.
        Prefix findings SPEC*.
 

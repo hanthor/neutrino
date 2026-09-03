@@ -63,7 +63,9 @@ use neutrino_event::{EventPolicy, now_ms};
 
 use crate::ports::{FederationTransport, ForwardExtremities, MissingEventsFetcher, TransportError};
 use crate::reconcile;
-use crate::util::{BACKOFF_BASE, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff};
+use crate::util::{
+    BACKOFF_BASE, MAX_EDUS_PER_TXN, MAX_PDUS_PER_TXN, TxnIdGen, jitter, next_backoff,
+};
 
 /// Shared, cheaply-cloneable handles every sender task needs. Bundled so the
 /// per-destination signatures stay readable as the pool grows (mirrors
@@ -258,9 +260,23 @@ async fn run_destination<S: StorageBackend + 'static>(
                 continue;
             }
         };
+        // EDUs ride the same transaction as whatever PDUs are pending — or one
+        // of their own when nothing else is. A to-device message is how a room
+        // key reaches the peer, so it is queued and retried exactly like an
+        // event, not fired and forgotten.
+        let edus = match ctx.store.pending_edus(&dest, MAX_EDUS_PER_TXN).await {
+            Ok(e) => e,
+            Err(e) => {
+                error!(%dest, error = %e, "reading pending EDUs");
+                if sleep_backoff(&mut backoff, &mut kick_rx).await {
+                    backoff = BACKOFF_BASE;
+                }
+                continue;
+            }
+        };
 
-        if !batch.is_empty() {
-            if deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await {
+        if !batch.is_empty() || !edus.is_empty() {
+            if deliver_batch(&ctx, &dest, &batch, &edus, &mut backoff, &mut kick_rx).await {
                 backoff = BACKOFF_BASE;
                 continue;
             }
@@ -318,11 +334,15 @@ enum SendOutcome {
 /// array. The caller owns `txn_id` (so a post-success durable-write fault can
 /// re-call this under the *same* id, which the peer dedups on `(origin, txnId)`)
 /// and decides what `Delivered` / `Rejected` mean for its durable state.
+// The argument list is the transaction envelope plus the retry state; the same
+// allowance the outbound client makes for `get_missing_events`.
+#[allow(clippy::too_many_arguments)]
 async fn send_transaction_with_retry<S: StorageBackend + 'static>(
     ctx: &SenderCtx<S>,
     dest: &ServerName,
     txn_id: &str,
     pdus: &[Box<RawJsonValue>],
+    edus: &[Box<RawJsonValue>],
     our_fes: &BTreeMap<OwnedRoomId, ForwardExtremities>,
     backoff: &mut Duration,
     kick_rx: &mut watch::Receiver<()>,
@@ -340,6 +360,7 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
             %dest,
             txn = %txn_id,
             pdus = pdus.len(),
+            edus = edus.len(),
             rooms = our_fes.len(),
             attempt,
             "outbound PUT /_matrix/federation/v1/send",
@@ -349,7 +370,7 @@ async fn send_transaction_with_retry<S: StorageBackend + 'static>(
         let send_result = match ctx.send_slots.acquire().await {
             Ok(_permit) => {
                 ctx.transport
-                    .send_transaction(dest, txn_id, pdus, our_fes)
+                    .send_transaction(dest, txn_id, pdus, edus, our_fes)
                     .await
             }
             // The semaphore is never closed in normal operation; an error here
@@ -390,22 +411,27 @@ fn covered_by(batch: &[neutrino_event::Event]) -> BTreeSet<OwnedEventId> {
         .collect()
 }
 
-/// Deliver one outbox batch to `dest`: a transaction carrying the batch's PDUs
-/// and our forward extremities. On a 2xx the batch is removed from the outbox
-/// and — because the transaction carried our heads — any standing advertisement
-/// obligation for the rooms it covered is cleared (the piggyback IS the
-/// advertisement). A 4xx drops the batch but leaves the obligation (our heads
-/// never landed, so the duty stands). A post-2xx `remove_pdus` fault re-sends
-/// under the same txn id (the peer dedups). Returns `false` only on shutdown.
+/// Deliver one outbox batch to `dest`: a transaction carrying the batch's PDUs,
+/// any pending EDUs, and our forward extremities. On a 2xx the batch is removed
+/// from the outbox and — because the transaction carried our heads — any
+/// standing advertisement obligation for the rooms it covered is cleared (the
+/// piggyback IS the advertisement). A 4xx drops the batch but leaves the
+/// obligation (our heads never landed, so the duty stands). A post-2xx removal
+/// fault re-sends under the same txn id (the peer dedups). EDUs follow the
+/// PDUs' fate in both directions: they were in the same envelope, so the peer
+/// accepted or rejected them together. Returns `false` only on shutdown.
 async fn deliver_batch<S: StorageBackend + 'static>(
     ctx: &SenderCtx<S>,
     dest: &ServerName,
     batch: &[neutrino_event::Event],
+    edus: &[neutrino_store::OutboxEdu],
     backoff: &mut Duration,
     kick_rx: &mut watch::Receiver<()>,
 ) -> bool {
     let pdus: Vec<Box<RawJsonValue>> = batch.iter().map(|e| e.raw.clone()).collect();
     let ids: Vec<&EventId> = batch.iter().map(|e| &*e.event_id).collect();
+    let edu_bodies: Vec<Box<RawJsonValue>> = edus.iter().map(|e| e.raw.clone()).collect();
+    let edu_ids: Vec<&str> = edus.iter().map(|e| e.edu_id.as_str()).collect();
 
     // Our forward extremities for every room in the batch, so the peer can
     // reconcile against us. Computed once (reused across retries — it's a hint).
@@ -428,17 +454,26 @@ async fn deliver_batch<S: StorageBackend + 'static>(
 
     let txn_id = ctx.idgen.next_id();
     loop {
-        match send_transaction_with_retry(ctx, dest, &txn_id, &pdus, &advert, backoff, kick_rx)
-            .await
+        match send_transaction_with_retry(
+            ctx,
+            dest,
+            &txn_id,
+            &pdus,
+            &edu_bodies,
+            &advert,
+            backoff,
+            kick_rx,
+        )
+        .await
         {
             SendOutcome::Shutdown => return false,
             // 4xx: drop the batch (retrying won't help), but DO NOT clear the
             // advertisement obligation — our heads never landed, so it stands. A
             // removal fault re-sends (and re-4xxs) under the same txn id.
-            SendOutcome::Rejected => match ctx.store.remove_pdus(dest, &ids).await {
+            SendOutcome::Rejected => match remove_batch(ctx, dest, &ids, &edu_ids).await {
                 Ok(()) => return true,
                 Err(e) => {
-                    error!(%dest, error = %e, "removing rejected PDUs from outbox");
+                    error!(%dest, error = %e, "removing rejected batch from outbox");
                     if sleep_backoff(backoff, kick_rx).await {
                         *backoff = BACKOFF_BASE;
                     }
@@ -451,7 +486,7 @@ async fn deliver_batch<S: StorageBackend + 'static>(
                 // can only ever duplicate (the re-send re-marks the same event,
                 // which the store's max-guard absorbs).
                 record_deliveries(ctx, dest, batch).await;
-                match ctx.store.remove_pdus(dest, &ids).await {
+                match remove_batch(ctx, dest, &ids, &edu_ids).await {
                     Ok(()) => {
                         // The transaction carried `our_fes`, so this 2xx satisfied any
                         // standing advertisement obligation for the rooms it covered.
@@ -471,7 +506,7 @@ async fn deliver_batch<S: StorageBackend + 'static>(
                     Err(e) => {
                         // Rows survive a removal fault; back off and re-send under the
                         // same txn id (the peer dedups) rather than hot-looping.
-                        error!(%dest, error = %e, "removing delivered PDUs from outbox");
+                        error!(%dest, error = %e, "removing delivered batch from outbox");
                         if sleep_backoff(backoff, kick_rx).await {
                             *backoff = BACKOFF_BASE;
                         }
@@ -480,6 +515,20 @@ async fn deliver_batch<S: StorageBackend + 'static>(
             }
         }
     }
+}
+
+/// Drop a delivered (or rejected) batch's rows — PDUs first, then EDUs. Two
+/// writes rather than one transaction: a fault between them leaves the EDUs
+/// queued for the next send, which the peer dedups on `message_id`, so the
+/// worst case is a duplicate the recipient already discards.
+async fn remove_batch<S: StorageBackend + 'static>(
+    ctx: &SenderCtx<S>,
+    dest: &ServerName,
+    ids: &[&EventId],
+    edu_ids: &[&str],
+) -> Result<(), neutrino_store::StorageError> {
+    ctx.store.remove_pdus(dest, ids).await?;
+    ctx.store.remove_edus(dest, edu_ids).await
 }
 
 /// Mark, per room in the delivered batch, the newest event `dest` has now
@@ -562,6 +611,7 @@ async fn send_advertisement<S: StorageBackend + 'static>(
             dest,
             &txn_id,
             &empty_pdus,
+            &[],
             &our_fes,
             backoff,
             kick_rx,
@@ -721,6 +771,9 @@ mod tests {
     struct Stub {
         /// Decoded PDUs of every accepted transaction (one `Vec` per txn).
         accepted: Mutex<Vec<Vec<Value>>>,
+        /// Decoded EDUs of every accepted transaction (one `Vec` per txn,
+        /// parallel to `accepted`).
+        accepted_edus: Mutex<Vec<Vec<Value>>>,
         /// The advertised `forward_extremities` of every accepted transaction,
         /// as JSON — lets anti-entropy tests assert an advertisement carried our
         /// heads (`fes[0].get(room).is_some()`).
@@ -740,6 +793,7 @@ mod tests {
             dest: &ServerName,
             txn_id: &str,
             pdus: &[Box<RawJsonValue>],
+            edus: &[Box<RawJsonValue>],
             forward_extremities: &BTreeMap<OwnedRoomId, ForwardExtremities>,
         ) -> Result<BTreeMap<OwnedRoomId, ForwardExtremities>, TransportError> {
             if self.dead.lock().unwrap().contains(dest) {
@@ -759,6 +813,11 @@ mod tests {
                 .unwrap()
                 .push(serde_json::to_value(forward_extremities).unwrap());
             self.accepted.lock().unwrap().push(decoded);
+            let decoded_edus: Vec<Value> = edus
+                .iter()
+                .map(|e| serde_json::from_str(e.get()).expect("stub edu is valid JSON"))
+                .collect();
+            self.accepted_edus.lock().unwrap().push(decoded_edus);
             // The peer reports no forward extremities, so reconciliation never fires.
             Ok(BTreeMap::new())
         }
@@ -975,6 +1034,154 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_owned()
+    }
+
+    /// Poll until `dest`'s EDU outbox is empty, or panic after ~10s.
+    async fn wait_edus_drained(store: &SqliteStore, dest: &ServerName) {
+        for _ in 0..500 {
+            if store
+                .pending_edus(dest, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("EDU outbox for {dest} not drained within timeout");
+    }
+
+    fn room_key_edu(session: &str) -> Box<RawJsonValue> {
+        serde_json::value::to_raw_value(&json!({
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": "@alice:local.test",
+                "type": "m.room_key",
+                "message_id": session,
+                "messages": { "@bob:peer.test": { "*": { "session_id": session } } },
+            },
+        }))
+        .unwrap()
+    }
+
+    // A destination owed only an EDU — no PDUs at all — still gets a sender
+    // task, and the EDU goes out in a transaction of its own and is removed on
+    // the peer's 2xx. This is the room-key path on a mesh: the peer is idle
+    // from the event stream's point of view, and the key must still reach it.
+    #[tokio::test]
+    async fn delivers_an_edu_only_outbox_and_drains_it() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        let tempfile = TempDir::new().unwrap();
+        let store = Arc::new(SqliteStore::open_in_dir(tempfile.path()).await.unwrap());
+        store
+            .enqueue_edu(&[dest.clone()], "k1", &room_key_edu("S1"))
+            .await
+            .unwrap();
+
+        drop(spawn(
+            store.clone(),
+            stub.clone(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+            no_kick(),
+            null_fetcher(),
+            EventPolicy::trusted_network(),
+            null_poke(),
+        ));
+        wait_edus_drained(&store, &dest).await;
+
+        let delivered = stub.accepted_edus.lock().unwrap().clone();
+        let edus: Vec<&Value> = delivered.iter().flatten().collect();
+        assert_eq!(edus.len(), 1);
+        assert_eq!(edus[0]["edu_type"], "m.direct_to_device");
+        assert_eq!(
+            edus[0]["content"]["messages"]["@bob:peer.test"]["*"]["session_id"],
+            "S1"
+        );
+        // The envelope carried no PDUs: an EDU-only transaction.
+        assert!(stub.accepted.lock().unwrap().iter().all(Vec::is_empty));
+        assert!(store.pending_destinations().await.unwrap().is_empty());
+    }
+
+    // The point of durability: a room key shared while the peer is out of
+    // range is delivered when the peer comes back, not dropped.
+    #[tokio::test]
+    async fn edu_queued_while_peer_is_unreachable_is_delivered_when_it_returns() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        stub.dead.lock().unwrap().insert(dest.clone());
+        let tempfile = TempDir::new().unwrap();
+        let store = Arc::new(SqliteStore::open_in_dir(tempfile.path()).await.unwrap());
+
+        let (kick_tx, kick_rx) = watch::channel(());
+        drop(spawn(
+            store.clone(),
+            stub.clone(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+            kick_rx,
+            null_fetcher(),
+            EventPolicy::trusted_network(),
+            null_poke(),
+        ));
+
+        // Share the key while the peer cannot be reached; give the sender a
+        // moment to fail and back off, and check nothing was lost.
+        store
+            .enqueue_edu(&[dest.clone()], "k1", &room_key_edu("S1"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(stub.accepted_edus.lock().unwrap().is_empty());
+        assert_eq!(
+            store.pending_edus(&dest, usize::MAX).await.unwrap().len(),
+            1
+        );
+
+        // The peer walks back into range: connectivity restored, backoff kicked.
+        stub.dead.lock().unwrap().remove(&dest);
+        kick_tx.send(()).unwrap();
+        wait_edus_drained(&store, &dest).await;
+
+        let delivered = stub.accepted_edus.lock().unwrap().clone();
+        assert_eq!(delivered.iter().flatten().count(), 1);
+    }
+
+    // EDUs ride the same transaction as pending PDUs when both are queued, and
+    // both halves are cleared by the one 2xx.
+    #[tokio::test]
+    async fn edus_ride_along_with_pending_pdus() {
+        let stub = Arc::new(Stub::default());
+        let dest = peer();
+        let (store, _tmp, _room, _ids) = store_with_outbox(&dest, 2).await;
+        store
+            .enqueue_edu(&[dest.clone()], "k1", &room_key_edu("S1"))
+            .await
+            .unwrap();
+
+        drop(spawn(
+            store.clone(),
+            stub.clone(),
+            2,
+            NO_JITTER,
+            no_shutdown(),
+            no_kick(),
+            null_fetcher(),
+            EventPolicy::trusted_network(),
+            null_poke(),
+        ));
+        wait_drained(&store, &dest).await;
+        wait_edus_drained(&store, &dest).await;
+
+        let txns = stub.accepted.lock().unwrap().clone();
+        let edu_txns = stub.accepted_edus.lock().unwrap().clone();
+        assert_eq!(txns.len(), 1, "one transaction carried everything");
+        assert_eq!(txns[0].len(), 2);
+        assert_eq!(edu_txns[0].len(), 1);
     }
 
     #[tokio::test]
@@ -1290,7 +1497,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, &[], &mut backoff, &mut kick_rx).await);
 
         // Checked before the stub locks are taken, so no guard is held across it.
         assert!(
@@ -1336,7 +1543,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, &[], &mut backoff, &mut kick_rx).await);
 
         assert_eq!(
             batch.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(),
@@ -1413,7 +1620,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        let delivered = deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await;
+        let delivered = deliver_batch(&ctx, &dest, &batch, &[], &mut backoff, &mut kick_rx).await;
 
         assert!(delivered, "a 4xx drops the batch (returns true)");
         assert!(
@@ -1462,7 +1669,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, &[], &mut backoff, &mut kick_rx).await);
 
         assert_eq!(
             marks(&store).await,
@@ -1491,7 +1698,7 @@ mod tests {
         let batch = store.pending_pdus(&dest, MAX_PDUS_PER_TXN).await.unwrap();
         let mut backoff = BACKOFF_BASE;
         let mut kick_rx = test_backoff();
-        assert!(deliver_batch(&ctx, &dest, &batch, &mut backoff, &mut kick_rx).await);
+        assert!(deliver_batch(&ctx, &dest, &batch, &[], &mut backoff, &mut kick_rx).await);
 
         assert!(
             marks(&store).await.is_empty(),
@@ -1543,7 +1750,7 @@ mod tests {
         let mut kick_rx = test_backoff();
         for dest in [&one, &two] {
             let batch = store.pending_pdus(dest, MAX_PDUS_PER_TXN).await.unwrap();
-            assert!(deliver_batch(&ctx, dest, &batch, &mut backoff, &mut kick_rx).await);
+            assert!(deliver_batch(&ctx, dest, &batch, &[], &mut backoff, &mut kick_rx).await);
         }
 
         let mut got = marks(&store).await;
