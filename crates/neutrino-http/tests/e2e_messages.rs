@@ -435,3 +435,68 @@ async fn bad_params_are_rejected() {
         assert_eq!(body["errcode"], "M_INVALID_PARAM", "query: {q}");
     }
 }
+
+/// `GET /rooms/{room}/event/{id}` returns the event as a member sees it, and
+/// a redacted one comes back pruned with the redaction attached — the same
+/// view `/messages` gives, one event at a time.
+#[tokio::test]
+async fn get_event_returns_the_event_and_prunes_a_redacted_one() {
+    let (app, _tmp) = test_router().await;
+    let room_id = room_with_messages(&app, 1).await;
+    let (status, page) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let event_id = page["chunk"][0]["event_id"]
+        .as_str()
+        .expect("event id")
+        .to_string();
+
+    let (status, event) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/event/{event_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(event["event_id"], event_id);
+    assert_eq!(event["room_id"], room_id);
+    assert_eq!(event["content"]["body"], "msg 0");
+
+    let (status, _) = put(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/txn-redact"),
+        &json!({"reason": "typo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "redact");
+
+    let (status, event) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/event/{event_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(event["content"], json!({}), "pruned");
+    assert_eq!(
+        event["unsigned"]["redacted_because"]["content"]["reason"],
+        "typo"
+    );
+
+    // An unknown id, and a real id under the wrong room, are both not found.
+    let (status, body) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/event/$nope"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
+    let other = room_with_messages(&app, 0).await;
+    let (status, _) = get(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{other}/event/{event_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

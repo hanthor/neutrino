@@ -3459,11 +3459,28 @@ async fn typing_extension_lists_other_people_typing_and_not_me() {
         serde_json::json!([peer.as_str()])
     );
 
-    // Stopping empties it; an absent room carries no entry rather than an
-    // empty list.
+    // Stopping is news: the room comes back once with nobody in it, which
+    // is what takes the indicator down — and then not again.
     state.ephemeral.set_typing(&room_id, peer, false, None);
-    let resp = handle(&state, me, ephemeral_request()).await.unwrap();
-    assert!(resp.extensions.typing.rooms.is_empty());
+    let mut next = ephemeral_request();
+    next.pos = Some(resp.pos.clone());
+    let resp = handle(&state, me, next).await.unwrap();
+    let typing = resp
+        .extensions
+        .typing
+        .rooms
+        .get(&room_id)
+        .expect("the stop is reported");
+    let event: Value = serde_json::from_str(typing.json().get()).unwrap();
+    assert_eq!(event["content"]["user_ids"], serde_json::json!([]));
+
+    let mut next = ephemeral_request();
+    next.pos = Some(resp.pos.clone());
+    let resp = handle(&state, me, next).await.unwrap();
+    assert!(
+        resp.extensions.typing.rooms.is_empty(),
+        "nothing changed since, nothing reported"
+    );
 }
 
 #[tokio::test]

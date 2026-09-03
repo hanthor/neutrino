@@ -5774,6 +5774,7 @@ async fn upload_device(app: &axum::Router, user: &str, device: &str, one_time_ke
                 "device_id": device,
                 "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
                 "keys": { format!("curve25519:{device}"): "curve", format!("ed25519:{device}"): "ed" },
+                "signatures": { user: { format!("ed25519:{device}"): "sig" } },
             },
             "one_time_keys": one_time_keys,
         }),
@@ -5835,8 +5836,27 @@ async fn federation_keys_query_answers_only_for_our_own_users() {
     // Answering for another server's user would let one node substitute keys
     // for another's — the exact attack E2EE exists to stop.
     let (app, _tmp) = test_router().await;
-    upload_device(&app, peer_user().as_str(), "THEIRS", json!({})).await;
+    // The client-server upload refuses keys for anyone but the caller, so a
+    // peer's user can never enter this node's directory that way...
+    let (status, body) = post_json(
+        &app,
+        "/_matrix/client/v3/keys/upload",
+        &json!({
+            "device_keys": {
+                "user_id": peer_user().as_str(),
+                "device_id": "THEIRS",
+                "algorithms": [],
+                "keys": {},
+                "signatures": {},
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["errcode"], "M_BAD_JSON");
 
+    // ...and a federation query for that user answers with nothing held —
+    // the peer's own server is the only authority for its keys.
     let (status, body) = post_json(
         &app,
         FED_KEYS_QUERY,

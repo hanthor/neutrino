@@ -100,6 +100,12 @@ pub struct Conn {
     /// does. Held as a plain `u64` for the same reason `last_event_stream_pos`
     /// is — the newtype belongs to the store's API, not the cursor.
     pub last_delivery_pos: u64,
+    /// The ephemeral change counter as it stood when this connection last
+    /// rendered a typing extension. The next render asks for the rooms whose
+    /// typing set changed after it — which is how a stop reaches the client
+    /// as an empty notice rather than by omission. `0` on a fresh connection:
+    /// every room that has ever had a notice is reported once.
+    pub ephemeral_version: u64,
     pub lists: BTreeMap<String, ListCfg>,
     pub subs: BTreeMap<OwnedRoomId, SubCfg>,
     pub sent: HashMap<OwnedRoomId, RoomSent>,

@@ -19,6 +19,7 @@
 //! nothing here ever needs `App`. Lock order, where both are taken, is `App`
 //! then this — never the reverse.
 
+use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -76,8 +77,10 @@ fn raw(value: &Value) -> Box<RawJsonValue> {
 pub(crate) struct KeyStore {
     /// `device_keys[user][device] -> the uploaded device key object`.
     pub(crate) devices: BTreeMap<String, BTreeMap<String, Value>>,
-    /// `one_time_keys[user][device][key_id] -> key`. Claiming removes.
-    pub(crate) one_time_keys: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
+    /// `one_time_keys[user][device][key_id] -> key`, in upload order: a claim
+    /// hands out the oldest key first (MSC4225), so the inner map keeps the
+    /// order keys arrived in rather than sorting by id. Claiming removes.
+    pub(crate) one_time_keys: BTreeMap<String, BTreeMap<String, IndexMap<String, Value>>>,
     /// Cross-signing keys, merged as uploaded and echoed back on query.
     pub(crate) cross_signing: serde_json::Map<String, Value>,
     /// Where every mutation is written through to, when persistence is
@@ -205,7 +208,11 @@ impl KeyStore {
     ) -> serde_json::Map<String, Value> {
         let mut out = serde_json::Map::new();
         for (user, wanted) in requested {
+            // A user we hold nothing for answers with an empty map: the
+            // caller asked about them and gets a definite "no devices", not
+            // an absence it would have to read as "not answered".
             let Some(devices) = self.devices.get(user) else {
+                out.insert(user.clone(), Value::Object(serde_json::Map::new()));
                 continue;
             };
             let filter = wanted.as_array().filter(|ids| !ids.is_empty());
@@ -263,7 +270,7 @@ impl KeyStore {
             .keys()
             .find(|id| id.split_once(':').is_some_and(|(a, _)| a == algorithm))
             .cloned()?;
-        let key = keys.remove(&key_id)?;
+        let key = keys.shift_remove(&key_id)?;
         self.journal(Op::RemoveOneTimeKey {
             user: user.to_owned(),
             device: device.to_owned(),

@@ -117,7 +117,12 @@ pub fn synthesize_v5_request(query: &LegacyQuery) -> v5::Request {
     req.lists = lists;
 
     req.room_subscriptions = BTreeMap::new();
-    req.extensions = Default::default();
+    // Typing notices and read receipts ride as extensions; `translate_response`
+    // folds them into each joined room's `ephemeral.events`.
+    let mut extensions = v5::request::Extensions::default();
+    extensions.typing.enabled = Some(true);
+    extensions.receipts.enabled = Some(true);
+    req.extensions = extensions;
 
     req
 }
@@ -217,6 +222,39 @@ pub fn translate_response(
         }
     }
 
+    // Typing notices and read receipts arrive as extensions keyed by room;
+    // legacy clients expect them in the joined room's `ephemeral.events`. A
+    // room can carry a notice without carrying an event — a delta whose only
+    // news is that someone started or stopped typing — so a missing room
+    // entry is created bare rather than the notice dropped.
+    let ephemeral = resp
+        .extensions
+        .typing
+        .rooms
+        .iter()
+        .map(|(room, raw)| (room, raw.json().get()))
+        .chain(
+            resp.extensions
+                .receipts
+                .rooms
+                .iter()
+                .map(|(room, raw)| (room, raw.json().get())),
+        );
+    for (room_id, raw_json) in ephemeral {
+        if !matches!(memberships.get(room_id), Some(Membership::Join)) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(raw_json) else {
+            continue;
+        };
+        let entry = join
+            .entry(room_id.to_string())
+            .or_insert_with(empty_joined_room_shape);
+        if let Some(Value::Array(events)) = entry.pointer_mut("/ephemeral/events") {
+            events.push(event);
+        }
+    }
+
     json!({
         "next_batch": resp.pos,
         "rooms": {
@@ -259,6 +297,23 @@ fn joined_room_shape(room: &v5::response::Room) -> Value {
         "org.matrix.msc4222.state_after": {
             "events": state_events,
         },
+        "ephemeral": {"events": []},
+        "account_data": {"events": []},
+    })
+}
+
+/// A joined room with nothing in it but the buckets: the shell a typing
+/// notice or receipt is folded into when the response carried no event for
+/// the room.
+fn empty_joined_room_shape() -> Value {
+    json!({
+        "timeline": {
+            "events": [],
+            "limited": false,
+            "prev_batch": "",
+        },
+        "state": {"events": []},
+        "org.matrix.msc4222.state_after": {"events": []},
         "ephemeral": {"events": []},
         "account_data": {"events": []},
     })

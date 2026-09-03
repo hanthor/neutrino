@@ -28,13 +28,15 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 | POST | `/_matrix/client/v3/rooms/{room_id}/{leave,invite,kick,ban,unban}` | `m.room.member` via the room actor; real v12 auth (rule 5) + state-res |
 | GET/POST | keys/*, profile (self), account_data (GET self), room_keys/version, pushers/set | stubs |
 
+**Update 2026-09-03 (this fork):** the E2EE and ephemeral surface is wired — `/keys/upload` (validated), `/keys/query`, `/keys/claim` (upload order), `/sendToDevice` → `to_device`, `/typing`, `/receipt` (through the sliding-sync extensions and legacy `/sync` `ephemeral.events`), `/redact` (applied on read), `GET /rooms/{room}/event/{id}`, and the federation key/EDU routes behind them. Ten allowlist entries added; see the allowlist's last block for what was tried and left out.
+
 **Still NOT wired** (these gate tests below):
-- No `GET /rooms/{room}/event/{eventId}`. (`GET /rooms/{room}/messages` landed 2026-06-04 — join-gated pagination.)
 - No `POST /user/{uid}/filter` (+ `GET …/filter/{id}`) — blocks the large filtered-`/sync` tranche.
 - No `/joined_members`, `/joined_rooms`, `/publicRooms`, `/directory/room/{alias}` (no room directory).
-- No `/forget`, `/redact`, `/upgrade`, `/typing`, profile/displayname/avatar writes, account_data writes.
+- No `/forget`, `/upgrade`, profile/displayname/avatar writes, account_data writes (so no `/read_markers`).
+- No `/devices` management, no `m.device_list_update` (so no `device_lists.changed` in sync).
 - 404 fallback returns plain text, not `{"errcode":"M_UNRECOGNIZED"}`.
-- No EDUs / E2EE / receipts / presence / push rules; no working cross-server federation join.
+- No presence / push rules; no working cross-server federation join.
 
 **Harness constraint:** `scripts/complement.sh` runs `go test … ./tests/csapi/...` only. Tests outside `csapi` — `tests/msc4222/*` (the MSC4222 dual-emission suite), `tests/v12_test.go`, all `tests/federation_*` — are **not executed by the allowlist loop**. Running them needs a harness change (extra package globs), not just an allowlist line. (2026-06-03: the CI `complement` job now builds the neutrino image with buildx + GitHub Actions layer cache, so the cargo-chef deps layer persists across runs; `scripts/complement.sh` reuses a pre-built image via `SKIP_IMAGE_BUILD`.)
 

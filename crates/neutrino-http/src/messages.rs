@@ -21,9 +21,9 @@ use std::str::FromStr;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use ruma::OwnedRoomId;
 use ruma::events::AnyTimelineEvent;
 use ruma::serde::Raw;
+use ruma::{OwnedEventId, OwnedRoomId};
 use serde_json::{Map, Value, json};
 
 use neutrino_store::{Direction, EventStore, PaginationToken};
@@ -292,6 +292,79 @@ pub(crate) async fn get_messages(
     }
 
     (StatusCode::OK, axum::Json(Value::Object(body))).into_response()
+}
+
+/// CSAPI `GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}` — one event,
+/// as a current member sees it: pruned where an allowed redaction targets it,
+/// the redaction carried as `unsigned.redacted_because`, the same view
+/// `/messages` gives. Not a member, or an event that is not this room's, is
+/// `404 M_NOT_FOUND` — the spec's one answer for both, so a non-member cannot
+/// tell whether an id exists.
+pub(crate) async fn get_event(
+    state: State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((room_id, event_id)): Path<(String, String)>,
+) -> axum::response::Response {
+    let rid = match OwnedRoomId::try_from(room_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                &format!("invalid room id: {e}"),
+            );
+        }
+    };
+    let eid = match OwnedEventId::try_from(event_id) {
+        Ok(e) => e,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                &format!("invalid event id: {e}"),
+            );
+        }
+    };
+    let not_found = || error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found.");
+
+    match current_membership(&state.0, &rid, &user).await {
+        Ok(Some(m)) if m == "join" => {}
+        Ok(_) => return not_found(),
+        Err(resp) => return resp,
+    }
+
+    let store = lock_app(&state.0).store.clone();
+    let events = match store.get_events(&[&eid]).await {
+        Ok(events) => events,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    // The id is global but the route is room-scoped: an event of another
+    // room is not found here, whatever the caller's membership there.
+    let Some(event) = events.into_iter().find(|e| e.room_id == rid) else {
+        return not_found();
+    };
+    let events = vec![event];
+    let redacted = match crate::redactions::applicable(&*store, &rid, &events).await {
+        Ok(map) => map,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            );
+        }
+    };
+    let mut views = crate::redactions::timeline_views(&events, &redacted);
+    let Some(view) = views.pop() else {
+        return not_found();
+    };
+    (StatusCode::OK, axum::Json(view)).into_response()
 }
 
 #[cfg(test)]

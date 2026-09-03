@@ -107,3 +107,26 @@ TestRoomCreate/Parallel/Rooms_can_be_created_with_an_initial_invite_list_\(SYN-2
 # TestSendAndFetchMessage is blocked on a durable stream-position legacy /sync
 # token — see VIABLE-TESTS.md.
 TestFetchMessagesFromNonExistentRoom$
+
+# The E2EE and ephemeral surface (2026-09-03). Unlocked by the key transport
+# and ephemeral-data work on this fork: real device/one-time key storage with
+# `/keys/claim`, `/sendToDevice` delivered under `to_device`, `/typing` and
+# `/receipt` surfaced through the sliding-sync extensions and folded into
+# legacy `/sync`'s `ephemeral.events`, `/redact` applied on read, and
+# `GET /rooms/{room}/event/{id}`. `TestUploadKey` runs whole: its query and
+# claim subtests depend on the sibling upload having run first, and the two
+# rejection subtests (malformed keys, another user's keys) pass here because
+# `/keys/upload` validates. Not viable, and why: `TestKeyChangesLocal` and
+# `TestDeviceListUpdates` need `device_lists.changed` (no
+# `m.device_list_update` yet); `TestDeviceManagement` needs `/devices`;
+# `TestRoomReadMarkers` needs room account data.
+TestTyping$
+TestLeakyTyping$
+TestRoomReceipts$
+TestRedact$
+TestToDeviceMessages$
+TestUploadKey$
+TestUploadKeyIdempotency$
+TestUploadKeyIdempotencyOverlap$
+TestKeyClaimOrdering$
+TestKeysQueryWithDeviceIDAsObjectFails$

@@ -482,3 +482,56 @@ async fn legacy_sync_create_event_carries_room_id_and_event_id() {
         "create event carries injected room_id (wire bytes lack it for v12): {create}",
     );
 }
+
+/// Typing notices and read receipts reach a legacy client in the joined
+/// room's `ephemeral.events`, without a `room_id` on the event.
+#[tokio::test]
+async fn legacy_sync_carries_typing_and_receipts_as_ephemeral_events() {
+    let (app, _tmp) = test_router().await;
+    let (status, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let room_id = body["room_id"].as_str().expect("room_id").to_string();
+    let (status, sent) = put(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1"),
+        &json!({"msgtype": "m.text", "body": "hi"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let event_id = sent["event_id"].as_str().expect("event_id").to_string();
+
+    let (status, _) = put(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/typing/@alice:example.org"),
+        &json!({"typing": true, "timeout": 10_000}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "typing");
+    let (status, _) = post(
+        &app,
+        &format!("/_matrix/client/v3/rooms/{room_id}/receipt/m.read/{event_id}"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "receipt");
+
+    let (status, body) = get(&app, LEGACY_SYNC_PATH, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = body["rooms"]["join"][&room_id]["ephemeral"]["events"]
+        .as_array()
+        .expect("ephemeral events");
+    let typing = events
+        .iter()
+        .find(|e| e["type"] == "m.typing")
+        .expect("m.typing");
+    assert!(typing.get("room_id").is_none(), "no room_id down /sync");
+    let receipt = events
+        .iter()
+        .find(|e| e["type"] == "m.receipt")
+        .expect("m.receipt");
+    assert!(receipt.get("room_id").is_none());
+    assert!(
+        receipt["content"][&event_id]["m.read"]["@alice:example.org"]["ts"].is_number(),
+        "own read receipt: {receipt}"
+    );
+}

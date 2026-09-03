@@ -492,6 +492,9 @@ CREATE TABLE one_time_keys (
     device  TEXT NOT NULL,
     key_id  TEXT NOT NULL,
     key     TEXT NOT NULL,
+    -- Upload order. A claim hands out the oldest key first (MSC4225), and a
+    -- WITHOUT ROWID table has no implicit order to lean on.
+    seq     INTEGER NOT NULL,
     PRIMARY KEY (user, device, key_id)
 ) STRICT, WITHOUT ROWID;
 

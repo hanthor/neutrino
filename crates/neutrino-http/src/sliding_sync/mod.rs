@@ -43,7 +43,7 @@ mod receipts;
 #[cfg(test)]
 mod tests;
 
-use conn::{ConnEntry, ConnKey, ConnRegistry};
+use conn::{Conn, ConnEntry, ConnKey, ConnRegistry};
 
 /// MSC4186 §"Connection Identifier": `conn_id` is max 16 chars on the wire.
 const MAX_CONN_ID_LEN: usize = 16;
@@ -333,7 +333,14 @@ pub async fn handle<S: StorageBackend>(
         }
     };
 
-    populate_extensions(state, user_id, &extensions_req, &mut final_resp).await?;
+    populate_extensions(
+        state,
+        user_id,
+        &extensions_req,
+        &mut conn_guard,
+        &mut final_resp,
+    )
+    .await?;
 
     // `build_response` chose `conn.pos + 1` as the response's pos_token but
     // didn't mutate `conn.pos` — commit the advance here, once per request,
@@ -489,6 +496,7 @@ async fn populate_extensions<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
     req_ext: &v5::request::Extensions,
+    conn: &mut Conn,
     resp: &mut v5::Response,
 ) -> Result<(), SyncError> {
     if req_ext.e2ee.enabled == Some(true) {
@@ -504,11 +512,15 @@ async fn populate_extensions<S: StorageBackend>(
         resp.extensions.e2ee = e2ee;
     }
     if req_ext.typing.enabled == Some(true) {
-        // Every room with a live notice that this user is joined to — not
-        // only the rooms the response happens to mention, since a delta with
-        // no new events is exactly when a typing notice is the news.
+        // Every room whose typing set changed since this connection last
+        // looked, among the rooms this user is joined to — not only the rooms
+        // the response happens to mention, since a delta with no new events
+        // is exactly when a typing notice is the news. A room that emptied is
+        // reported with no users: that is what tells the client to take the
+        // indicator down.
+        let now = state.ephemeral.version();
         let mut typing = v5::response::Typing::default();
-        for room_id in state.ephemeral.rooms_with_typing() {
+        for room_id in state.ephemeral.typing_changed_since(conn.ephemeral_version) {
             if !state
                 .store
                 .joined_members(&room_id)
@@ -523,9 +535,6 @@ async fn populate_extensions<S: StorageBackend>(
                 .into_iter()
                 .filter(|u| u != user_id)
                 .collect();
-            if users.is_empty() {
-                continue;
-            }
             // ruma's `SyncTypingEvent` is `#[non_exhaustive]`; build the wire
             // shape directly, which is one object with two keys.
             let event = serde_json::json!({ "type": "m.typing", "content": { "user_ids": users } });
@@ -533,6 +542,7 @@ async fn populate_extensions<S: StorageBackend>(
                 typing.rooms.insert(room_id.clone(), Raw::from_json(raw));
             }
         }
+        conn.ephemeral_version = now;
         resp.extensions.typing = typing;
     }
     if req_ext.receipts.enabled == Some(true) {

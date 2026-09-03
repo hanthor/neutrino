@@ -34,8 +34,15 @@ pub(crate) struct ReadReceipt {
 
 #[derive(Default)]
 struct Inner {
-    /// `typing[room][user] -> when the notice expires`.
+    /// `typing[room][user] -> when the notice expires`. A room stays in the
+    /// map once it has had a notice, empty or not, so a stop can be told
+    /// apart from never having started.
     typing: BTreeMap<OwnedRoomId, BTreeMap<OwnedUserId, Instant>>,
+    /// The change counter's value when `typing[room]` last changed — a start,
+    /// a stop, or an expiry noticed on read. A sync that remembers the
+    /// counter it last served asks for the rooms stamped after it, which is
+    /// how "nobody is typing any more" reaches a client as an empty notice.
+    typing_changed: BTreeMap<OwnedRoomId, u64>,
     /// `receipts[room][user] -> newest m.read`.
     receipts: BTreeMap<OwnedRoomId, BTreeMap<OwnedUserId, ReadReceipt>>,
 }
@@ -71,6 +78,32 @@ impl EphemeralState {
         self.changed.send_modify(|n| *n += 1);
     }
 
+    /// Record that `room`'s typing set changed, stamped with the counter
+    /// value the bump produces. Called with the lock held so the stamp and
+    /// the counter cannot disagree.
+    fn stamp_typing(&self, inner: &mut Inner, room: &RoomId) {
+        let next = *self.changed.borrow() + 1;
+        inner.typing_changed.insert(room.to_owned(), next);
+        self.changed.send_modify(|n| *n = next);
+    }
+
+    /// Drop expired notices in every room, stamping the rooms that lost one.
+    fn expire_typing(&self, inner: &mut Inner) {
+        let now = Instant::now();
+        let expired: Vec<OwnedRoomId> = inner
+            .typing
+            .iter_mut()
+            .filter_map(|(room, users)| {
+                let before = users.len();
+                users.retain(|_, expiry| *expiry > now);
+                (users.len() != before).then(|| room.clone())
+            })
+            .collect();
+        for room in expired {
+            self.stamp_typing(inner, &room);
+        }
+    }
+
     /// The change counter now; compare a later reading to know whether
     /// anything moved in between.
     pub(crate) fn version(&self) -> u64 {
@@ -101,23 +134,36 @@ impl EphemeralState {
         } else {
             room_typing.remove(user);
         }
-        drop(inner);
         // A refreshed notice is not a change worth waking for; a start or a
         // stop is.
         if before != typing {
-            self.bump();
+            self.stamp_typing(&mut inner, room);
         }
     }
 
     /// Users typing in `room` right now, expired notices dropped.
     pub(crate) fn typing_in(&self, room: &RoomId) -> Vec<OwnedUserId> {
-        let now = Instant::now();
         let mut inner = self.lock();
-        let Some(room_typing) = inner.typing.get_mut(room) else {
-            return Vec::new();
-        };
-        room_typing.retain(|_, expiry| *expiry > now);
-        room_typing.keys().cloned().collect()
+        self.expire_typing(&mut inner);
+        inner
+            .typing
+            .get(room)
+            .map(|users| users.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Rooms whose typing set changed after the counter stood at `since` —
+    /// including rooms that emptied, which is the news a stop carries.
+    /// `since = 0` is every room that has ever had a notice.
+    pub(crate) fn typing_changed_since(&self, since: u64) -> Vec<OwnedRoomId> {
+        let mut inner = self.lock();
+        self.expire_typing(&mut inner);
+        inner
+            .typing_changed
+            .iter()
+            .filter(|(_, stamp)| **stamp > since)
+            .map(|(room, _)| room.clone())
+            .collect()
     }
 
     /// Move a user's read position in `room` forward to `event_id`. A receipt
@@ -135,17 +181,6 @@ impl EphemeralState {
         room_receipts.insert(user.to_owned(), receipt);
         drop(inner);
         self.bump();
-    }
-
-    /// Rooms with at least one live typing notice.
-    pub(crate) fn rooms_with_typing(&self) -> Vec<OwnedRoomId> {
-        let now = Instant::now();
-        let mut inner = self.lock();
-        inner.typing.retain(|_, users| {
-            users.retain(|_, expiry| *expiry > now);
-            !users.is_empty()
-        });
-        inner.typing.keys().cloned().collect()
     }
 
     /// Rooms with at least one read receipt.
@@ -189,6 +224,36 @@ mod tests {
         assert!(
             s.typing_in(room).is_empty(),
             "expired notices are dropped on read"
+        );
+    }
+
+    #[test]
+    fn a_stop_is_a_change_a_sync_can_ask_for() {
+        let s = EphemeralState::new();
+        let room = room_id!("!r:x");
+        let other = room_id!("!other:x");
+        let alice = user_id!("@alice:x");
+        assert!(s.typing_changed_since(0).is_empty(), "nothing yet");
+
+        s.set_typing(room, alice, true, None);
+        let served = s.version();
+        assert_eq!(s.typing_changed_since(0), vec![room.to_owned()]);
+        assert!(s.typing_changed_since(served).is_empty(), "already served");
+
+        s.set_typing(room, alice, false, None);
+        assert_eq!(
+            s.typing_changed_since(served),
+            vec![room.to_owned()],
+            "the stop is news even though the room is now empty"
+        );
+        assert!(s.typing_in(room).is_empty());
+
+        let served = s.version();
+        s.set_typing(other, alice, true, Some(Duration::ZERO));
+        assert_eq!(
+            s.typing_changed_since(served),
+            vec![other.to_owned()],
+            "an expiry noticed on read is a change too"
         );
     }
 

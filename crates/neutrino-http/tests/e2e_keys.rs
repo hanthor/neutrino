@@ -105,7 +105,8 @@ async fn well_formed_upload_round_trips_through_query() {
             "user_id": user,
             "device_id": "DEVICEID",
             "algorithms": ["m.megolm.v1.aes-sha2"],
-            "keys": { "ed25519:DEVICEID": "abc" }
+            "keys": { "ed25519:DEVICEID": "abc" },
+            "signatures": { user.clone(): { "ed25519:DEVICEID": "sig" } }
         }
     });
     assert!(post(&app, UPLOAD, &upload).await.is_success());

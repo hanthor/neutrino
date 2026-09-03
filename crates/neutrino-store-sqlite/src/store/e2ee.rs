@@ -37,7 +37,7 @@ impl E2eeStore for SqliteStore {
             }
 
             let mut stmt = conn.prepare(
-                "SELECT user, device, key_id, key FROM one_time_keys ORDER BY user, device, key_id",
+                "SELECT user, device, key_id, key FROM one_time_keys ORDER BY user, device, seq",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -119,8 +119,8 @@ impl E2eeStore for SqliteStore {
             let tx = conn.transaction()?;
             {
                 let mut stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO one_time_keys (user, device, key_id, key) \
-                     VALUES (?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO one_time_keys (user, device, key_id, key, seq) \
+                     VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM one_time_keys))",
                 )?;
                 for (key_id, key) in &keys {
                     stmt.execute(params![user, device, key_id, key])?;

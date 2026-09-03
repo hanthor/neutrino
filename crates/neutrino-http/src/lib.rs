@@ -631,6 +631,10 @@ fn build_router(state: &AppState) -> Router {
             get(messages::get_messages),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
+            get(messages::get_event),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}",
             put(put_event),
         )
@@ -1345,7 +1349,7 @@ fn merge_key_answer(into: &mut serde_json::Map<String, Value>, answer: Value) {
 /// purely local answer would always be empty. A peer we cannot reach lands in
 /// `failures` rather than failing the whole query — the client can still
 /// encrypt to everyone it did get keys for, and will retry the rest.
-async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn keys_query(state: State<AppState>, body: Json<Value>) -> axum::response::Response {
     info!("Received query: {:?}", body.0);
     let (our_name, fed_client, e2ee) = {
         let app = lock_app(&state.0);
@@ -1361,6 +1365,19 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
         .and_then(Value::as_object)
         .cloned()
         .filter(|map| !map.is_empty());
+
+    // Each user maps to a list of device ids (empty for all of them). Any
+    // other shape is the client's mistake, and answering it with keys would
+    // hide that.
+    if let Some(map) = &requested
+        && map.values().any(|wanted| !wanted.is_array())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            "device_keys must map each user to a list of device ids",
+        );
+    }
 
     // An absent or empty request map means "everything this node holds" — the
     // shape the single-user dev client sends. It has no federated meaning
@@ -1379,7 +1396,7 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
         for (key, value) in inner.keys.cross_signing.iter() {
             response.insert(key.clone(), value.clone());
         }
-        return Json(Value::Object(response));
+        return Json(Value::Object(response)).into_response();
     };
 
     let (mine, theirs) = split_by_server(&requested, &our_name);
@@ -1405,13 +1422,9 @@ async fn keys_query(state: State<AppState>, body: Json<Value>) -> Json<Value> {
         }
     }
     response.insert("failures".to_owned(), Value::Object(failures));
-    Json(Value::Object(response))
+    Json(Value::Object(response)).into_response()
 }
 
-/// Queue to-device messages for their recipients. This is how a Megolm room
-/// key reaches the devices that need it: without it a client can claim a
-/// one-time key and still have nowhere to send the session it just built.
-///
 /// Queue to-device messages for their recipients. This is how a Megolm room
 /// key reaches the devices that need it: without it a client can claim a
 /// one-time key and still have nowhere to send the session it just built.
@@ -1538,23 +1551,42 @@ async fn keys_claim(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     Json(json!({ "one_time_keys": claimed, "failures": failures }))
 }
 
-async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
+async fn keys_upload(
+    state: State<AppState>,
+    AuthUser(caller): AuthUser,
+    body: Json<Value>,
+) -> axum::response::Response {
     info!("Received keys upload: {:?}", body.0);
 
-    let (fallback_user, e2ee) = {
-        let app = lock_app(&state.0);
-        (app.config.user_id(), app.e2ee.clone())
-    };
+    let e2ee = lock_app(&state.0).e2ee.clone();
     let body = body.0;
 
-    // Trust the ids the device names for itself, falling back to this node's
-    // user and a conventional device id only when the upload omits them.
+    // The device keys, if any, must be well formed and the caller's own: a
+    // device key object names its user and device and carries the three
+    // fields a peer needs to use it. Anything else is `M_BAD_JSON`, including
+    // keys that claim another user — a device cannot publish keys for someone
+    // else, whatever it says in the body.
     let device_keys = body.pointer("/device_keys");
-    let user = device_keys
-        .and_then(|k| k.get("user_id"))
-        .and_then(Value::as_str)
-        .unwrap_or(&fallback_user)
-        .to_owned();
+    if let Some(keys) = device_keys {
+        let bad = |why: &str| error_response(StatusCode::BAD_REQUEST, "M_BAD_JSON", why);
+        let Some(obj) = keys.as_object() else {
+            return bad("device_keys must be an object");
+        };
+        if obj.get("user_id").and_then(Value::as_str) != Some(caller.as_str()) {
+            return bad("device_keys.user_id must be the requesting user");
+        }
+        if obj.get("device_id").and_then(Value::as_str).is_none() {
+            return bad("device_keys.device_id is required");
+        }
+        for field in ["algorithms", "keys", "signatures"] {
+            if obj.get(field).is_none() {
+                return bad(&format!("device_keys.{field} is required"));
+            }
+        }
+    }
+    // One-time keys without device keys belong to the caller; the device id
+    // falls back to the conventional one only when nothing names it.
+    let user = caller.to_string();
     let device = device_keys
         .and_then(|k| k.get("device_id"))
         .and_then(Value::as_str)
@@ -1570,7 +1602,7 @@ async fn keys_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
     }
 
     let counts = inner.keys.one_time_key_counts(&user, &device);
-    Json(json!({ "one_time_key_counts": counts }))
+    Json(json!({ "one_time_key_counts": counts })).into_response()
 }
 
 async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {
