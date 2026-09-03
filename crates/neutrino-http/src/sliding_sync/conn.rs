@@ -106,6 +106,10 @@ pub struct Conn {
     /// as an empty notice rather than by omission. `0` on a fresh connection:
     /// every room that has ever had a notice is reported once.
     pub ephemeral_version: u64,
+    /// The account-data change counter as it stood when this connection last
+    /// rendered the `account_data` extension; `0` means everything held is
+    /// sent next time.
+    pub account_data_version: u64,
     /// The device-change log position this connection last rendered into
     /// `device_lists.changed`. Users who changed after it are reported on the
     /// next e2ee extension; `0` on a fresh connection reports everyone who

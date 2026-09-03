@@ -1643,6 +1643,7 @@ async fn to_device_extension_delivers_and_drains_the_inbox() {
 
     state.e2ee.push_to_device(
         user.as_str(),
+        "*",
         "m.room_key",
         "@bob:peer.example",
         serde_json::json!({ "session_id": "S1" }),
@@ -1696,6 +1697,7 @@ async fn to_device_message_wakes_a_long_poll() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     state.e2ee.push_to_device(
         user.as_str(),
+        "*",
         "m.room_key",
         "@bob:peer.example",
         serde_json::json!({ "session_id": "S1" }),
@@ -1718,6 +1720,7 @@ async fn to_device_not_drained_when_extension_is_off() {
     let user = user_id!("@alice:example.org");
     state.e2ee.push_to_device(
         user.as_str(),
+        "*",
         "m.room_key",
         "@bob:peer.example",
         serde_json::json!({ "session_id": "S1" }),
@@ -1725,7 +1728,7 @@ async fn to_device_not_drained_when_extension_is_off() {
 
     let resp = handle(&state, user, Request::new()).await.unwrap();
     assert!(resp.extensions.to_device.is_none());
-    assert_eq!(state.e2ee.pending_to_device(user.as_str()), 1);
+    assert_eq!(state.e2ee.pending_to_device(user.as_str(), "*"), 1);
 }
 
 #[tokio::test]

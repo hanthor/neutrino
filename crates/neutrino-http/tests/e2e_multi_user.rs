@@ -1284,3 +1284,85 @@ async fn messages_requires_membership() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["errcode"], json!("M_INVALID_PARAM"), "{body}");
 }
+
+/// A session survives a restart on the same storage directory: the token a
+/// client holds still resolves, to the same user and device. The mesh test
+/// rig restarts nodes on purpose; a restart that signed everyone out would
+/// make every restart proof fail for the wrong reason.
+#[tokio::test]
+async fn sessions_survive_a_restart_on_the_same_storage_dir() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut cfg = config();
+    cfg.storage_dir = tmp.path().to_path_buf();
+
+    let app1 = router(cfg.clone()).await.expect("router boot 1");
+    let (status, body) = send(
+        &app1,
+        "POST",
+        "/_matrix/client/v3/login",
+        None,
+        &json!({ "type": "m.login.password", "user": "bob", "password": "x", "device_id": "PHONE" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["access_token"].as_str().unwrap().to_owned();
+    drop(app1);
+
+    let app2 = router(cfg).await.expect("router boot 2");
+    let (status, who) = send(
+        &app2,
+        "GET",
+        "/_matrix/client/v3/account/whoami",
+        Some(&token),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{who}");
+    assert_eq!(who["user_id"], "@bob:example.org");
+    assert_eq!(who["device_id"], "PHONE");
+}
+
+/// A one-time-key upload that names no device keys lands on the caller's own
+/// device — the one its token was minted for — so a later claim for that
+/// device finds it. (Every login is its own device now; a conventional
+/// fallback id would match nothing.)
+#[tokio::test]
+async fn key_only_uploads_land_on_the_callers_device() {
+    let (app, _tmp) = test_router().await;
+    let (user, token) = register(&app, "otk-owner").await;
+    let (_, who) = send(
+        &app,
+        "GET",
+        "/_matrix/client/v3/account/whoami",
+        Some(&token),
+        &json!({}),
+    )
+    .await;
+    let device = who["device_id"].as_str().unwrap().to_owned();
+    assert_ne!(device, "DEVICEID");
+
+    let (status, counts) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/keys/upload",
+        Some(&token),
+        &json!({ "one_time_keys": { "signed_curve25519:k1": { "key": "k1" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{counts}");
+    assert_eq!(counts["one_time_key_counts"]["signed_curve25519"], 1);
+
+    let (status, claimed) = send(
+        &app,
+        "POST",
+        "/_matrix/client/v3/keys/claim",
+        Some(&token),
+        &json!({ "one_time_keys": { user.clone(): { device.clone(): "signed_curve25519" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        claimed["one_time_keys"][&user][&device]["signed_curve25519:k1"]["key"], "k1",
+        "{claimed}"
+    );
+}

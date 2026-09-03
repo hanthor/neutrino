@@ -64,18 +64,19 @@ impl E2eeStore for SqliteStore {
             }
 
             let mut stmt = conn.prepare(
-                "SELECT inbox_id, user, event FROM to_device_inbox ORDER BY inbox_id ASC",
+                "SELECT inbox_id, user, device, event FROM to_device_inbox ORDER BY inbox_id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             for r in rows {
-                let (id, user, event) = r?;
-                snapshot.to_device.push((id, user, raw(event)?));
+                let (id, user, device, event) = r?;
+                snapshot.to_device.push((id, user, device, raw(event)?));
             }
 
             let mut stmt = conn.prepare("SELECT user, stream_id FROM device_streams")?;
@@ -195,13 +196,15 @@ impl E2eeStore for SqliteStore {
         &self,
         id: i64,
         user: &str,
+        device: &str,
         event: &RawJsonValue,
     ) -> Result<(), StorageError> {
-        let (user, event) = (user.to_owned(), event.get().to_owned());
+        let (user, device, event) = (user.to_owned(), device.to_owned(), event.get().to_owned());
         self.run_write(move |conn| -> Result<(), Error> {
             conn.execute(
-                "INSERT OR IGNORE INTO to_device_inbox (inbox_id, user, event) VALUES (?, ?, ?)",
-                params![id, user, event],
+                "INSERT OR IGNORE INTO to_device_inbox (inbox_id, user, device, event) \
+                 VALUES (?, ?, ?, ?)",
+                params![id, user, device, event],
             )?;
             Ok(())
         })
@@ -297,28 +300,29 @@ mod tests {
     #[tokio::test]
     async fn inbox_keeps_order_and_ids() {
         let s = store().await;
-        s.push_to_device(7, "@a:x", &raw(json!({ "n": 7 })))
+        s.push_to_device(7, "@a:x", "D1", &raw(json!({ "n": 7 })))
             .await
             .unwrap();
-        s.push_to_device(3, "@a:x", &raw(json!({ "n": 3 })))
+        s.push_to_device(3, "@a:x", "D1", &raw(json!({ "n": 3 })))
             .await
             .unwrap();
-        s.push_to_device(7, "@a:x", &raw(json!({ "n": 70 })))
+        s.push_to_device(7, "@a:x", "D1", &raw(json!({ "n": 70 })))
             .await
             .unwrap();
-        s.push_to_device(9, "@b:x", &raw(json!({ "n": 9 })))
+        s.push_to_device(9, "@b:x", "*", &raw(json!({ "n": 9 })))
             .await
             .unwrap();
 
         let snap = s.load_e2ee().await.unwrap();
-        let ids: Vec<i64> = snap.to_device.iter().map(|(id, _, _)| *id).collect();
+        let ids: Vec<i64> = snap.to_device.iter().map(|(id, _, _, _)| *id).collect();
         assert_eq!(ids, [3, 7, 9]);
-        assert_eq!(snap.to_device[1].2.get(), r#"{"n":7}"#, "repeat id ignored");
+        assert_eq!(snap.to_device[1].3.get(), r#"{"n":7}"#, "repeat id ignored");
 
         s.remove_to_device(&[3, 7]).await.unwrap();
         s.remove_to_device(&[]).await.unwrap();
         let snap = s.load_e2ee().await.unwrap();
         assert_eq!(snap.to_device.len(), 1);
         assert_eq!(snap.to_device[0].1, "@b:x");
+        assert_eq!(snap.to_device[0].2, "*");
     }
 }

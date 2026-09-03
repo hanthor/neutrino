@@ -11,7 +11,7 @@ use ruma::OwnedUserId;
 
 /// In-memory map of opaque access token → the user it authenticates.
 /// Ephemeral: lives in `App`, lost on restart (acceptable for tests).
-pub(crate) type UserTokens = HashMap<String, OwnedUserId>;
+pub(crate) type UserTokens = HashMap<String, (OwnedUserId, String)>;
 
 /// Mint a fresh, unique access token of the Synapse-ish `syt_<random>`
 /// shape. 32 random alphanumerics give ample collision resistance for a
@@ -42,7 +42,7 @@ pub(crate) enum TokenError {
 pub(crate) fn resolve(
     headers: &HeaderMap,
     tokens: &std::sync::Mutex<UserTokens>,
-) -> Result<OwnedUserId, TokenError> {
+) -> Result<(OwnedUserId, String), TokenError> {
     let header = headers
         .get(axum::http::header::AUTHORIZATION)
         .ok_or(TokenError::Missing)?;
@@ -62,6 +62,7 @@ pub(crate) fn provision(
     server_name: &str,
     default_user_id: &str,
     requested_localpart: Option<&str>,
+    device_id: &str,
 ) -> Result<(OwnedUserId, String), String> {
     let user_id: OwnedUserId = match requested_localpart {
         Some(lp) if !lp.is_empty() => format!("@{lp}:{server_name}")
@@ -76,7 +77,7 @@ pub(crate) fn provision(
     tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(token.clone(), user_id.clone());
+        .insert(token.clone(), (user_id.clone(), device_id.to_owned()));
     Ok((user_id, token))
 }
 

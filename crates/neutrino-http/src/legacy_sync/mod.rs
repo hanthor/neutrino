@@ -38,6 +38,7 @@ pub mod translate;
 pub(crate) async fn handle(
     state: State<AppState>,
     crate::AuthUser(user_id): crate::AuthUser,
+    crate::AuthDevice(device): crate::AuthDevice,
     query: Query<HashMap<String, String>>,
 ) -> axum::response::Response {
     let sync_state = lock_app(&state.0).sync_state.clone();
@@ -66,11 +67,11 @@ pub(crate) async fn handle(
     // unknown/stale token we don't 400; we fall back to a full initial sync,
     // which returns current state under a fresh token. (Stale tokens collapse to
     // "state now" rather than a true cumulative delta — see docs/legacy-sync-stub.md.)
-    let resp = match sliding_sync::handle(&sync_state, &user_id, req).await {
+    let resp = match sliding_sync::handle_as(&sync_state, &user_id, &device, req).await {
         Err(SyncError::UnknownPos) => {
             let mut initial = synthesize_v5_request(&legacy_query);
             initial.pos = None;
-            sliding_sync::handle(&sync_state, &user_id, initial).await
+            sliding_sync::handle_as(&sync_state, &user_id, &device, initial).await
         }
         other => other,
     };
@@ -83,7 +84,7 @@ pub(crate) async fn handle(
             let pending = lock_app(&state.0)
                 .e2ee
                 .clone()
-                .drain_to_device(user_id.as_str());
+                .drain_to_device(user_id.as_str(), &device);
             if !pending.is_empty()
                 && let Some(slot) = body.pointer_mut("/to_device/events")
             {

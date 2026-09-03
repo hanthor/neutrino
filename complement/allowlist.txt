@@ -140,3 +140,9 @@ TestKeysQueryWithDeviceIDAsObjectFails$
 # built on matrix-sdk-crypto track room members themselves, so nothing we
 # ship depends on it.
 TestKeyChangesLocal$
+
+# Identity and account data (2026-09-03): `/account/whoami`, global and
+# per-room account data persisted and served by sync, a to-device inbox
+# keyed per device. `TestRoomReadMarkers` stays out: `/read_markers` is not
+# wired.
+TestAddAccountData$

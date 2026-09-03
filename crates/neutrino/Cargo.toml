@@ -9,6 +9,11 @@ name = "neutrino"
 path = "src/main.rs"
 
 [features]
+# The dev binary is what tests and CI talk to, and a server that hands every
+# login the same identity cannot be tested with two users or two devices. The
+# embedded build (neutrino-ffi) does not go through this crate and stays
+# single-user.
+default = ["multi-user-shim"]
 multi-user-shim = ["neutrino-main/multi-user-shim"]
 
 [dependencies]

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use neutrino_event::event_view::StateEventConversionError;
 
+use crate::account_data::AccountDataState;
 use crate::e2ee::E2eeState;
 use crate::ephemeral::EphemeralState;
 use neutrino_store::{StorageBackend, StorageError};
@@ -113,6 +114,9 @@ pub struct SyncState<S> {
     pub e2ee: Arc<E2eeState>,
     /// Typing notices and read receipts, shared and watched the same way.
     pub ephemeral: Arc<EphemeralState>,
+    /// Account data, shared with the handlers that write it and watched so
+    /// a write reaches a waiting sync now.
+    pub account_data: Arc<AccountDataState>,
     /// Whether to synthesise delivery receipts from federation delivery marks
     /// (`Config::delivery_receipts`, off by default — see [`receipts`]). Set by
     /// the composition root; a client must *also* opt into the receipts
@@ -131,6 +135,7 @@ impl<S> SyncState<S> {
             registry: ConnRegistry::new(),
             e2ee: Arc::new(E2eeState::new()),
             ephemeral: Arc::new(EphemeralState::new()),
+            account_data: Arc::new(AccountDataState::new()),
             delivery_receipts: false,
             shutdown,
         }
@@ -157,9 +162,25 @@ impl<S> SyncState<S> {
 ///    then snapshot the final response into `Conn::last_response` so any
 ///    retry returns the same bytes — including the to-device events, which
 ///    is what makes a drain safe against a lost response.
+///
+/// [`handle_as`] for a caller whose device is not known: the to-device
+/// inbox is drained for every device of the user. Tests and the single-user
+/// paths that predate per-device inboxes.
 pub async fn handle<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
+    req: v5::Request,
+) -> Result<v5::Response, SyncError> {
+    handle_as(state, user_id, "*", req).await
+}
+
+/// Serve one sliding-sync request for `device` of `user_id`. The device
+/// decides which to-device messages this response carries; everything else
+/// is per user.
+pub async fn handle_as<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+    device: &str,
     req: v5::Request,
 ) -> Result<v5::Response, SyncError> {
     validate_request(&req)?;
@@ -234,6 +255,9 @@ pub async fn handle<S: StorageBackend>(
     // so a change during the wait is returned by the build that follows it.
     let mut ephemeral_rx = state.ephemeral.subscribe();
     let ephemeral_at_start = state.ephemeral.version();
+    let mut account_data_rx = state.account_data.subscribe();
+    let account_data_at_start = state.account_data.version();
+    let wants_account_data = req.extensions.account_data.enabled == Some(true);
     let wants_ephemeral = req.extensions.typing.enabled == Some(true)
         || req.extensions.receipts.enabled == Some(true);
     // Device-list changes: a peer's new device is data for a client that
@@ -290,8 +314,9 @@ pub async fn handle<S: StorageBackend>(
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
         if !wait_for_data
             || has_data(&resp)
-            || has_to_device(state, user_id, &extensions_req)
+            || has_to_device(state, user_id, device, &extensions_req)
             || (wants_ephemeral && state.ephemeral.version() != ephemeral_at_start)
+            || (wants_account_data && state.account_data.version() != account_data_at_start)
             || (wants_e2ee && state.e2ee.device_seq() != device_seq_at_start)
         {
             break resp;
@@ -326,6 +351,7 @@ pub async fn handle<S: StorageBackend>(
                 _ = delivery_rx.changed(), if state.delivery_receipts => {}
                 _ = e2ee_rx.changed(), if extensions_req.to_device.enabled == Some(true) || wants_e2ee => {}
                 _ = ephemeral_rx.changed(), if wants_ephemeral => {}
+                _ = account_data_rx.changed(), if wants_account_data => {}
             }
         };
         tokio::select! {
@@ -342,6 +368,7 @@ pub async fn handle<S: StorageBackend>(
     populate_extensions(
         state,
         user_id,
+        device,
         &extensions_req,
         &mut conn_guard,
         &mut final_resp,
@@ -480,9 +507,11 @@ fn has_data(resp: &v5::Response) -> bool {
 fn has_to_device<S>(
     state: &SyncState<S>,
     user_id: &UserId,
+    device: &str,
     req_ext: &v5::request::Extensions,
 ) -> bool {
-    req_ext.to_device.enabled == Some(true) && state.e2ee.pending_to_device(user_id.as_str()) > 0
+    req_ext.to_device.enabled == Some(true)
+        && state.e2ee.pending_to_device(user_id.as_str(), device) > 0
 }
 
 /// Everyone who shares a joined room with `user_id`, the caller included.
@@ -513,6 +542,7 @@ async fn shared_room_members<S: StorageBackend>(
 async fn populate_extensions<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
+    device: &str,
     req_ext: &v5::request::Extensions,
     conn: &mut Conn,
     resp: &mut v5::Response,
@@ -611,6 +641,39 @@ async fn populate_extensions<S: StorageBackend>(
             }
         }
     }
+    if req_ext.account_data.enabled == Some(true) {
+        // Everything held on a connection's first look, what changed since
+        // on the later ones; each entry is `{type, content}`.
+        let now = state.account_data.version();
+        let (global, rooms) = state
+            .account_data
+            .changed_since(user_id.as_str(), conn.account_data_version);
+        let mut account_data = v5::response::AccountData::default();
+        let to_raw = |(event_type, content): (String, serde_json::Value)| {
+            serde_json::value::to_raw_value(
+                &serde_json::json!({ "type": event_type, "content": content }),
+            )
+            .ok()
+        };
+        account_data.global = global
+            .into_iter()
+            .filter_map(to_raw)
+            .map(Raw::from_json)
+            .collect();
+        for (room, entries) in rooms {
+            let Ok(room_id) = ruma::OwnedRoomId::try_from(room) else {
+                continue;
+            };
+            let events: Vec<_> = entries
+                .into_iter()
+                .filter_map(to_raw)
+                .map(Raw::from_json)
+                .collect();
+            account_data.rooms.insert(room_id, events);
+        }
+        conn.account_data_version = now;
+        resp.extensions.account_data = account_data;
+    }
     if req_ext.to_device.enabled == Some(true) {
         // ruma v5's response types are `#[non_exhaustive]`; build via Default
         // and field assignment rather than struct literal.
@@ -618,7 +681,7 @@ async fn populate_extensions<S: StorageBackend>(
         to_device.next_batch = resp.pos.clone();
         to_device.events = state
             .e2ee
-            .drain_to_device(user_id.as_str())
+            .drain_to_device(user_id.as_str(), device)
             .into_iter()
             .filter_map(|event| {
                 serde_json::value::to_raw_value(&event)

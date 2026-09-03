@@ -56,6 +56,7 @@ pub(crate) enum Op {
     PushToDevice {
         id: i64,
         user: String,
+        device: String,
         event: Box<RawJsonValue>,
     },
     RemoveToDevice {
@@ -340,14 +341,10 @@ pub(crate) struct Inner {
     /// Device keys, one-time keys and cross-signing blobs, per user and device.
     pub(crate) keys: KeyStore,
     /// Undelivered to-device messages, per recipient user, each under the id
-    /// its store row carries. Drained by sync.
-    ///
-    /// Keyed by user rather than by device because login issues one device id
-    /// for everyone, so the server cannot yet tell two of a user's devices
-    /// apart. On a mesh node — one user, one phone — the two are the same
-    /// thing; on a multi-device account they are not, and this needs
-    /// revisiting when login stops handing out a fixed device id.
-    pub(crate) to_device: BTreeMap<String, Vec<(i64, Value)>>,
+    /// its store row carries and the device it is for. Drained by the sync of
+    /// that device. `*` as the device is a message for whichever device of
+    /// the user syncs first — what a sender uses when it knows none of them.
+    pub(crate) to_device: BTreeMap<String, Vec<(i64, String, Value)>>,
     /// Next inbox id. Process-lifetime, seeded past the loaded snapshot's
     /// maximum so memory and disk name the same rows.
     next_inbox_id: i64,
@@ -419,13 +416,13 @@ impl E2eeState {
             }
         }
         let mut max_id = inner.next_inbox_id - 1;
-        for (id, user, event) in &snapshot.to_device {
+        for (id, user, device, event) in &snapshot.to_device {
             if let Some(event) = parse(event) {
                 inner
                     .to_device
                     .entry(user.clone())
                     .or_default()
-                    .push((*id, event));
+                    .push((*id, device.clone(), event));
                 max_id = max_id.max(*id);
             }
         }
@@ -460,9 +457,12 @@ impl E2eeState {
                     Op::PutCrossSigning { name, value } => {
                         store.put_cross_signing(name, value).await
                     }
-                    Op::PushToDevice { id, user, event } => {
-                        store.push_to_device(*id, user, event).await
-                    }
+                    Op::PushToDevice {
+                        id,
+                        user,
+                        device,
+                        event,
+                    } => store.push_to_device(*id, user, device, event).await,
                     Op::RemoveToDevice { ids } => store.remove_to_device(ids).await,
                     Op::SetDeviceStream { user, stream_id } => {
                         store.put_device_stream(user, *stream_id).await
@@ -475,10 +475,12 @@ impl E2eeState {
         });
     }
 
-    /// Queue one to-device event for `user` and wake anyone syncing as them.
+    /// Queue one to-device event for a device of `user` and wake anyone
+    /// syncing as them. `device` may be `*`: whichever device syncs first.
     pub(crate) fn push_to_device(
         &self,
         user: &str,
+        device: &str,
         event_type: &str,
         sender: &str,
         content: Value,
@@ -494,29 +496,76 @@ impl E2eeState {
         inner.keys.journal(Op::PushToDevice {
             id,
             user: user.to_owned(),
+            device: device.to_owned(),
             event: raw(&event),
         });
         inner
             .to_device
             .entry(user.to_owned())
             .or_default()
-            .push((id, event));
+            .push((id, device.to_owned(), event));
         drop(inner);
         self.changed.send_modify(|n| *n += 1);
     }
 
-    /// Take everything queued for a user, leaving the inbox empty. Matrix
-    /// expects a to-device message to be delivered once; the client
-    /// acknowledges by syncing again with the returned token.
-    pub(crate) fn drain_to_device(&self, user: &str) -> Vec<Value> {
+    /// Queue a `{device: content}` map as `/sendToDevice` and the
+    /// `m.direct_to_device` EDU carry it. `*` fans out to every device the
+    /// directory knows for the user — which is what a room-key share to a
+    /// freshly-seen peer uses — and, when it knows none, stays a wildcard
+    /// row for whichever device turns up first.
+    pub(crate) fn push_to_devices(
+        &self,
+        user: &str,
+        targets: &serde_json::Map<String, Value>,
+        event_type: &str,
+        sender: &str,
+    ) {
+        for (device, content) in targets {
+            if device == "*" {
+                let known: Vec<String> = self
+                    .lock()
+                    .keys
+                    .devices
+                    .get(user)
+                    .map(|d| d.keys().cloned().collect())
+                    .unwrap_or_default();
+                if known.is_empty() {
+                    self.push_to_device(user, "*", event_type, sender, content.clone());
+                }
+                for device in known {
+                    self.push_to_device(user, &device, event_type, sender, content.clone());
+                }
+            } else {
+                self.push_to_device(user, device, event_type, sender, content.clone());
+            }
+        }
+    }
+
+    /// Whether an inbox row addressed to `row_device` is for the device
+    /// syncing as `device`. A wildcard on either side matches.
+    fn addressed_to(row_device: &str, device: &str) -> bool {
+        row_device == "*" || device == "*" || row_device == device
+    }
+
+    /// Take everything queued for `device` of `user` (or every device, for
+    /// `*`), leaving the rest. Matrix expects a to-device message to be
+    /// delivered once; the client acknowledges by syncing again with the
+    /// returned token.
+    pub(crate) fn drain_to_device(&self, user: &str, device: &str) -> Vec<Value> {
         let mut inner = self.lock();
-        let drained = inner.to_device.remove(user).unwrap_or_default();
+        let Some(rows) = inner.to_device.get_mut(user) else {
+            return Vec::new();
+        };
+        let (drained, kept): (Vec<_>, Vec<_>) = std::mem::take(rows)
+            .into_iter()
+            .partition(|(_, row_device, _)| Self::addressed_to(row_device, device));
+        *rows = kept;
         if drained.is_empty() {
             return Vec::new();
         }
-        let ids: Vec<i64> = drained.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<i64> = drained.iter().map(|(id, _, _)| *id).collect();
         inner.keys.journal(Op::RemoveToDevice { ids });
-        drained.into_iter().map(|(_, event)| event).collect()
+        drained.into_iter().map(|(_, _, event)| event).collect()
     }
 
     /// Record a device-list change and wake every sync waiting on this
@@ -540,10 +589,14 @@ impl E2eeState {
         self.lock().keys.device_changes_since(since)
     }
 
-    /// How many to-device events wait for `user` — what a long-poll checks to
-    /// decide whether it has something to return.
-    pub(crate) fn pending_to_device(&self, user: &str) -> usize {
-        self.lock().to_device.get(user).map_or(0, Vec::len)
+    /// How many to-device events wait for `device` of `user` — what a
+    /// long-poll checks to decide whether it has something to return.
+    pub(crate) fn pending_to_device(&self, user: &str, device: &str) -> usize {
+        self.lock().to_device.get(user).map_or(0, |rows| {
+            rows.iter()
+                .filter(|(_, row_device, _)| Self::addressed_to(row_device, device))
+                .count()
+        })
     }
 
     /// A receiver that changes whenever the inbox is written to. Subscribe

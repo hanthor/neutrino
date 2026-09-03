@@ -516,7 +516,29 @@ CREATE TABLE cross_signing_keys (
 CREATE TABLE to_device_inbox (
     inbox_id  INTEGER NOT NULL PRIMARY KEY,
     user      TEXT NOT NULL,
+    -- The device the message is for; '*' for whichever of the user's devices
+    -- syncs first.
+    device    TEXT NOT NULL,
     event     TEXT NOT NULL
 ) STRICT;
 
 CREATE INDEX ix_to_device_inbox_user ON to_device_inbox(user, inbox_id);
+
+-- Per-user account data: global entries (room = '') and per-room entries,
+-- wire-verbatim JSON, replaced on write. What a client's DM list and room
+-- tags are, and what it finds again after a reinstall.
+CREATE TABLE account_data (
+    user        TEXT NOT NULL,
+    room        TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    PRIMARY KEY (user, room, event_type)
+) STRICT, WITHOUT ROWID;
+
+-- The multi-user shim's client sessions: access token -> user and device.
+-- Kept so a restart does not sign every client out.
+CREATE TABLE sessions (
+    token   TEXT NOT NULL PRIMARY KEY,
+    user    TEXT NOT NULL,
+    device  TEXT NOT NULL
+) STRICT, WITHOUT ROWID;

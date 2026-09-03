@@ -426,13 +426,7 @@ fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
             let Some(devices) = devices.as_object() else {
                 continue;
             };
-            // Device targeting collapses to the user, matching the local inbox:
-            // login hands every device the same id, so the server cannot tell
-            // two of a user's devices apart yet. `*` (every device) and a named
-            // device therefore behave identically here.
-            for message in devices.values() {
-                e2ee.push_to_device(user, &event_type, &sender, message.clone());
-            }
+            e2ee.push_to_devices(user, devices, &event_type, &sender);
         }
     }
 }

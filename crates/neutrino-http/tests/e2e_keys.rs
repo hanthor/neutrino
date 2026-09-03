@@ -167,3 +167,45 @@ async fn login_honours_the_device_id_the_client_names() {
     assert_eq!(named["device_id"], "IFNEWPHONE");
     assert_eq!(unnamed["device_id"], "DEVICEID");
 }
+
+/// `/account/whoami` reports the user and the device the session is for.
+#[tokio::test]
+async fn whoami_reports_user_and_device() {
+    async fn get_json(app: &axum::Router, path: &str) -> Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(resp.status().is_success(), "{path}: {}", resp.status());
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let (app, _tmp) = test_router().await;
+    let who = get_json(&app, "/_matrix/client/v3/account/whoami").await;
+    assert_eq!(who["user_id"], "@alice:example.org");
+    assert_eq!(who["device_id"], "DEVICEID");
+    assert_eq!(who["is_guest"], false);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/_matrix/client/v3/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "type": "m.login.password", "user": "alice", "password": "x", "device_id": "IFNEWPHONE" })).unwrap(),
+        ))
+        .unwrap();
+    assert!(
+        app.clone()
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let who = get_json(&app, "/_matrix/client/v3/account/whoami").await;
+    assert_eq!(who["device_id"], "IFNEWPHONE");
+}

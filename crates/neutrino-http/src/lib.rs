@@ -35,6 +35,7 @@ use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info, info_span, warn};
 
+mod account_data;
 mod e2ee;
 mod ephemeral;
 mod federation;
@@ -47,10 +48,12 @@ mod sliding_sync;
 #[cfg(feature = "multi-user-shim")]
 mod multi_user;
 
+use account_data::AccountDataState;
 use e2ee::E2eeState;
 use ephemeral::{EphemeralState, ReadReceipt};
 use federation::client::{FederationClient, ReqwestFetcher};
 use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
+use neutrino_store::AccountDataStore;
 use sliding_sync::{SyncError, SyncState};
 
 struct App {
@@ -86,6 +89,13 @@ struct App {
     e2ee: Arc<E2eeState>,
     /// Typing notices and read receipts, shared the same way. See [`ephemeral`].
     ephemeral: Arc<EphemeralState>,
+    /// Per-user account data, written through to the store and served by
+    /// sync. See [`account_data`].
+    account_data: Arc<AccountDataState>,
+    #[cfg_attr(feature = "multi-user-shim", allow(dead_code))]
+    /// The single-user build's device: whatever the last `/login` named. The
+    /// multi-user shim keeps a device per token instead (see [`AuthDevice`]).
+    current_device: String,
     /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
     /// currently-visible peers here and the user-directory search handler reads
     /// it. Shared (`Arc`) so the host can hold a write handle while the router
@@ -166,7 +176,7 @@ impl axum::extract::FromRequestParts<AppState> for AuthUser {
     ) -> Result<Self, Self::Rejection> {
         let tokens = lock_app(state).user_tokens.clone();
         match multi_user::resolve(&parts.headers, &tokens) {
-            Ok(user) => Ok(AuthUser(user)),
+            Ok((user, _device)) => Ok(AuthUser(user)),
             Err(multi_user::TokenError::Missing) => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "M_MISSING_TOKEN",
@@ -194,6 +204,48 @@ impl axum::extract::FromRequestParts<AppState> for AuthUser {
                 &e.to_string(),
             )),
         }
+    }
+}
+
+/// Per-request caller device, the companion of [`AuthUser`]. What the
+/// to-device inbox is keyed on and what `/account/whoami` reports.
+///
+/// - feature `multi-user-shim` ON: the device the token was minted for at
+///   `/register` or `/login`.
+/// - feature OFF: the device named at the most recent `/login` (or the
+///   conventional id when none was) — one phone, one device.
+pub struct AuthDevice(pub String);
+
+impl axum::extract::FromRequestParts<AppState> for AuthDevice {
+    type Rejection = axum::response::Response;
+
+    #[cfg(feature = "multi-user-shim")]
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let tokens = lock_app(state).user_tokens.clone();
+        match multi_user::resolve(&parts.headers, &tokens) {
+            Ok((_user, device)) => Ok(AuthDevice(device)),
+            Err(multi_user::TokenError::Missing) => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "M_MISSING_TOKEN",
+                "Missing access token",
+            )),
+            Err(multi_user::TokenError::Unknown) => Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "M_UNKNOWN_TOKEN",
+                "Unrecognised access token",
+            )),
+        }
+    }
+
+    #[cfg(not(feature = "multi-user-shim"))]
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(AuthDevice(lock_app(state).current_device.clone()))
     }
 }
 
@@ -282,10 +334,12 @@ impl AppState {
         let e2ee = Arc::new(E2eeState::new());
         e2ee.attach_persistence(store.clone());
         let ephemeral = Arc::new(EphemeralState::new());
+        let account_data = Arc::new(AccountDataState::new());
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
         sync_state.delivery_receipts = config.delivery_receipts;
         sync_state.e2ee = e2ee.clone();
         sync_state.ephemeral = ephemeral.clone();
+        sync_state.account_data = account_data.clone();
         let sync_state = Arc::new(sync_state);
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
@@ -321,6 +375,7 @@ impl AppState {
             sync_state,
             e2ee,
             ephemeral,
+            account_data,
             discovery,
             display_name_tx: None,
             policy,
@@ -330,6 +385,7 @@ impl AppState {
             joins: HashMap::new(),
             #[cfg(feature = "multi-user-shim")]
             user_tokens: Arc::new(Mutex::new(multi_user::UserTokens::new())),
+            current_device: "DEVICEID".to_owned(),
         };
         AppState(Arc::new(Mutex::new(app)))
     }
@@ -350,6 +406,50 @@ impl AppState {
         };
         let snapshot = store.load_e2ee().await?;
         e2ee.load(snapshot);
+        Ok(())
+    }
+
+    /// Reload the multi-user shim's sessions so a restart does not sign
+    /// every client out. Nothing to do in the single-user build.
+    #[cfg(feature = "multi-user-shim")]
+    pub(crate) async fn load_sessions(&self) -> Result<(), StorageError> {
+        let (store, tokens) = {
+            let app = lock_app(self);
+            (app.store.clone(), app.user_tokens.clone())
+        };
+        let rows = neutrino_store::SessionStore::load_sessions(store.as_ref()).await?;
+        let mut map = tokens.lock().unwrap_or_else(|e| e.into_inner());
+        for (token, user, device) in rows {
+            if let Ok(user) = OwnedUserId::try_from(user) {
+                map.insert(token, (user, device));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "multi-user-shim"))]
+    pub(crate) async fn load_sessions(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Rebuild account data from the store. Must run before the router
+    /// serves, or a client's first sync would say it has no DM list.
+    pub(crate) async fn load_account_data(&self) -> Result<(), StorageError> {
+        let (store, account_data) = {
+            let app = lock_app(self);
+            (app.store.clone(), app.account_data.clone())
+        };
+        let rows = store
+            .load_account_data()
+            .await?
+            .into_iter()
+            .filter_map(|(user, room, event_type, content)| {
+                serde_json::from_str::<Value>(content.get())
+                    .ok()
+                    .map(|content| (user, room, event_type, content))
+            })
+            .collect();
+        account_data.load(rows);
         Ok(())
     }
 
@@ -470,6 +570,8 @@ pub async fn serve(
     let state = AppState::from_store_with_discovery(config, store, discovery, policy);
     lock_app(&state).display_name_tx = display_name_tx;
     state.load_e2ee().await?;
+    state.load_account_data().await?;
+    state.load_sessions().await?;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
@@ -545,6 +647,8 @@ fn handle(command: Command, state: &AppState) -> ControlFlow<()> {
 pub async fn router(config: Config) -> Result<Router, StartupError> {
     let state = AppState::new(config).await?;
     state.load_e2ee().await?;
+    state.load_account_data().await?;
+    state.load_sessions().await?;
     Ok(build_router(&state))
 }
 
@@ -622,8 +726,13 @@ fn build_router(state: &AppState) -> Router {
         )
         .route(
             "/_matrix/client/v3/user/{user_id}/account_data/{account_data_type}",
-            get(get_account_data),
+            get(get_account_data).put(put_account_data),
         )
+        .route(
+            "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/account_data/{account_data_type}",
+            get(get_room_account_data).put(put_room_account_data),
+        )
+        .route("/_matrix/client/v3/account/whoami", get(whoami))
         .route("/_matrix/client/v3/room_keys/version", get(get_room_keys))
         .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/rooms/{room_id}/members", get(members))
@@ -955,12 +1064,13 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
 
     #[cfg(feature = "multi-user-shim")]
     {
-        let (tokens, server_name, default_user_id) = {
+        let (tokens, server_name, default_user_id, store) = {
             let app = lock_app(&state.0);
             (
                 app.user_tokens.clone(),
                 app.config.server_name.clone(),
                 app.config.user_id(),
+                app.store.clone(),
             )
         };
         // The UIA flow is stateless — this shim stores no per-session state, so
@@ -977,16 +1087,31 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
             &server_name,
             &default_user_id,
             requested.as_deref(),
+            &device_id,
         ) {
-            Ok((user_id, token)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "user_id": user_id,
-                    "access_token": token,
-                    "home_server": server_name,
-                    "device_id": device_id,
-                })),
-            ),
+            Ok((user_id, token)) => {
+                // A token that only lives in memory signs everyone out on a
+                // restart, and the mesh test rig restarts nodes on purpose.
+                if let Err(e) = neutrino_store::SessionStore::put_session(
+                    store.as_ref(),
+                    &token,
+                    user_id.as_str(),
+                    &device_id,
+                )
+                .await
+                {
+                    warn!(error = %e, "persisting the session");
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "user_id": user_id,
+                        "access_token": token,
+                        "home_server": server_name,
+                        "device_id": device_id,
+                    })),
+                )
+            }
             Err(e) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "errcode": "M_INVALID_USERNAME", "error": e })),
@@ -1012,14 +1137,28 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
 async fn post_login(state: State<AppState>, body: Json<Value>) -> (StatusCode, Json<Value>) {
     info!("Logged in");
 
+    // The device the client names is the device it gets — a reinstalled
+    // client picks a new id so it is a new device, not the old one with keys
+    // that no longer match. A login naming none gets a fresh id under the
+    // shim (every login is a device) and the conventional one in the
+    // single-user build (one phone, one device).
+    let named = body
+        .0
+        .pointer("/device_id")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .map(str::to_owned);
+
     #[cfg(feature = "multi-user-shim")]
     {
-        let (tokens, server_name, default_user_id) = {
+        let device_id = named.unwrap_or_else(fresh_device_id);
+        let (tokens, server_name, default_user_id, store) = {
             let app = lock_app(&state.0);
             (
                 app.user_tokens.clone(),
                 app.config.server_name.clone(),
                 app.config.user_id(),
+                app.store.clone(),
             )
         };
         let requested = body
@@ -1033,22 +1172,31 @@ async fn post_login(state: State<AppState>, body: Json<Value>) -> (StatusCode, J
             &server_name,
             &default_user_id,
             requested.as_deref(),
+            &device_id,
         ) {
-            Ok((user_id, token)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "user_id": user_id,
-                    "access_token": token,
-                    "home_server": server_name,
-                    "device_id": body
-                        .0
-                        .pointer("/device_id")
-                        .and_then(|v| v.as_str())
-                        .filter(|d| !d.is_empty())
-                        .map(str::to_owned)
-                        .unwrap_or_else(fresh_device_id),
-                })),
-            ),
+            Ok((user_id, token)) => {
+                // A token that only lives in memory signs everyone out on a
+                // restart, and the mesh test rig restarts nodes on purpose.
+                if let Err(e) = neutrino_store::SessionStore::put_session(
+                    store.as_ref(),
+                    &token,
+                    user_id.as_str(),
+                    &device_id,
+                )
+                .await
+                {
+                    warn!(error = %e, "persisting the session");
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "user_id": user_id,
+                        "access_token": token,
+                        "home_server": server_name,
+                        "device_id": device_id,
+                    })),
+                )
+            }
             // Mirror `/register`: a malformed identifier is a 400, not a 200
             // carrying a token that was never inserted into the map (which would
             // then 401 on the very next authenticated request).
@@ -1061,23 +1209,16 @@ async fn post_login(state: State<AppState>, body: Json<Value>) -> (StatusCode, J
 
     #[cfg(not(feature = "multi-user-shim"))]
     {
-        let app = lock_app(&state.0);
+        let device_id = named.unwrap_or_else(|| "DEVICEID".to_owned());
+        let mut app = lock_app(&state.0);
+        app.current_device = device_id.clone();
         (
             StatusCode::OK,
             Json(json!({
                 "user_id": app.config.user_id(),
                 "access_token": "syt_1234567890abcdef",
                 "home_server": app.config.server_name,
-                // The device the client names is the device it gets — a
-                // reinstalled client picks a new id so it is a new device,
-                // not the old one with keys that no longer match.
-                "device_id": body
-                    .0
-                    .pointer("/device_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|d| !d.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or_else(fresh_device_id),
+                "device_id": device_id,
             })),
         )
     }
@@ -1093,6 +1234,7 @@ async fn post_login(state: State<AppState>, body: Json<Value>) -> (StatusCode, J
 async fn sync(
     state: State<AppState>,
     AuthUser(user_id): AuthUser,
+    AuthDevice(device): AuthDevice,
     query: Query<HashMap<String, String>>,
     body: Json<Value>,
 ) -> axum::response::Response {
@@ -1125,7 +1267,7 @@ async fn sync(
     // than hang the client's serial sync loop forever.
     let handled = tokio::time::timeout(
         sliding_sync::BACKSTOP_TIMEOUT,
-        sliding_sync::handle(&sync_state, &user_id, req),
+        sliding_sync::handle_as(&sync_state, &user_id, &device, req),
     )
     .await;
 
@@ -1496,11 +1638,7 @@ async fn send_to_device(
         let Some(devices) = devices.as_object() else {
             continue;
         };
-        // `*` means every device of that user, which is what a room-key
-        // share to a freshly-seen peer uses.
-        for content in devices.values() {
-            e2ee.push_to_device(user, &event_type, sender.as_str(), content.clone());
-        }
+        e2ee.push_to_devices(user, devices, &event_type, sender.as_str());
     }
 
     // One EDU per destination server, carrying only that server's recipients.
@@ -1590,6 +1728,7 @@ async fn keys_claim(state: State<AppState>, body: Json<Value>) -> Json<Value> {
 async fn keys_upload(
     state: State<AppState>,
     AuthUser(caller): AuthUser,
+    AuthDevice(caller_device): AuthDevice,
     body: Json<Value>,
 ) -> axum::response::Response {
     info!("Received keys upload: {:?}", body.0);
@@ -1620,14 +1759,15 @@ async fn keys_upload(
             }
         }
     }
-    // One-time keys without device keys belong to the caller; the device id
-    // falls back to the conventional one only when nothing names it.
+    // One-time keys without device keys belong to the caller's own device —
+    // the one its token was minted for — not to a conventional id that no
+    // longer matches anything once every login is a device of its own.
     let user = caller.to_string();
     let device = device_keys
         .and_then(|k| k.get("device_id"))
         .and_then(Value::as_str)
-        .unwrap_or("DEVICEID")
-        .to_owned();
+        .map(str::to_owned)
+        .unwrap_or(caller_device);
 
     let counts = {
         let mut inner = e2ee.lock();
@@ -1934,16 +2074,156 @@ async fn user_directory_search(
     Json(json!({ "results": results, "limited": limited }))
 }
 
-async fn get_account_data(
-    axum::extract::Path((_user_id, _account_data_type)): axum::extract::Path<(String, String)>,
-) -> (StatusCode, Json<Value>) {
-    (
+/// The account-data routes are the caller's own: `{user_id}` must be the
+/// authenticated user, or the answer is `403 M_FORBIDDEN` whatever exists.
+fn not_your_account(caller: &ruma::UserId, user_id: &str) -> Option<axum::response::Response> {
+    (caller.as_str() != user_id).then(|| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "Account data belongs to the user who wrote it",
+        )
+    })
+}
+
+// The built `Response` is the deliberate error payload, as in `messages.rs`.
+#[allow(clippy::result_large_err)]
+fn account_data_body(body: Value) -> Result<Value, axum::response::Response> {
+    if body.is_object() {
+        Ok(body)
+    } else {
+        Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            "Account data content must be a JSON object",
+        ))
+    }
+}
+
+fn account_data_missing() -> axum::response::Response {
+    error_response(
         StatusCode::NOT_FOUND,
-        Json(json!({
-             "errcode": "M_NOT_FOUND",
-              "error": "No current backup version"
-        })),
+        "M_NOT_FOUND",
+        "Account data not found",
     )
+}
+
+async fn get_account_data(
+    state: State<AppState>,
+    AuthUser(caller): AuthUser,
+    axum::extract::Path((user_id, event_type)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    if let Some(denied) = not_your_account(&caller, &user_id) {
+        return denied;
+    }
+    let held = lock_app(&state.0).account_data.clone();
+    match held.get_global(&user_id, &event_type) {
+        Some(content) => Json(content).into_response(),
+        None => account_data_missing(),
+    }
+}
+
+/// `PUT /user/{user}/account_data/{type}`: written through to the store
+/// before it is acknowledged, then served by every sync from here on.
+async fn put_account_data(
+    state: State<AppState>,
+    AuthUser(caller): AuthUser,
+    axum::extract::Path((user_id, event_type)): axum::extract::Path<(String, String)>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    if let Some(denied) = not_your_account(&caller, &user_id) {
+        return denied;
+    }
+    let content = match account_data_body(body.0) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let (store, held) = {
+        let app = lock_app(&state.0);
+        (app.store.clone(), app.account_data.clone())
+    };
+    let raw = serde_json::value::to_raw_value(&content).expect("a Value always serializes");
+    if let Err(e) = store
+        .put_account_data(&user_id, None, &event_type, &raw)
+        .await
+    {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        );
+    }
+    held.set_global(&user_id, &event_type, content);
+    Json(json!({})).into_response()
+}
+
+async fn get_room_account_data(
+    state: State<AppState>,
+    AuthUser(caller): AuthUser,
+    axum::extract::Path((user_id, room_id, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> axum::response::Response {
+    if let Some(denied) = not_your_account(&caller, &user_id) {
+        return denied;
+    }
+    let held = lock_app(&state.0).account_data.clone();
+    match held.get_room(&user_id, &room_id, &event_type) {
+        Some(content) => Json(content).into_response(),
+        None => account_data_missing(),
+    }
+}
+
+async fn put_room_account_data(
+    state: State<AppState>,
+    AuthUser(caller): AuthUser,
+    axum::extract::Path((user_id, room_id, event_type)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    if let Some(denied) = not_your_account(&caller, &user_id) {
+        return denied;
+    }
+    if OwnedRoomId::try_from(room_id.as_str()).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "invalid room id",
+        );
+    }
+    let content = match account_data_body(body.0) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let (store, held) = {
+        let app = lock_app(&state.0);
+        (app.store.clone(), app.account_data.clone())
+    };
+    let raw = serde_json::value::to_raw_value(&content).expect("a Value always serializes");
+    if let Err(e) = store
+        .put_account_data(&user_id, Some(&room_id), &event_type, &raw)
+        .await
+    {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        );
+    }
+    held.set_room(&user_id, &room_id, &event_type, content);
+    Json(json!({})).into_response()
+}
+
+/// `GET /account/whoami`: who the token belongs to, and which device. The
+/// one call a client can make to check a stored session still means what it
+/// thinks it means.
+async fn whoami(AuthUser(user): AuthUser, AuthDevice(device): AuthDevice) -> Json<Value> {
+    Json(json!({ "user_id": user, "device_id": device, "is_guest": false }))
 }
 
 async fn get_room_keys() -> (StatusCode, Json<Value>) {

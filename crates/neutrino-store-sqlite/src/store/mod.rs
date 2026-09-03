@@ -1,6 +1,7 @@
 //! Trait implementations on [`crate::SqliteStore`]. One file per sub-trait
 //! so each method's pre/post conditions map 1:1 to a file boundary.
 
+mod account_data;
 mod dag;
 mod deliveries;
 mod e2ee;
@@ -10,6 +11,7 @@ mod inbox;
 mod invites;
 mod outbox;
 mod rooms;
+mod sessions;
 mod staging;
 mod state;
 mod state_provider;

@@ -839,8 +839,9 @@ pub struct E2eeSnapshot {
     pub one_time_keys: Vec<(String, String, String, Box<RawJsonValue>)>,
     /// `(name, value)` — the sections of a `/keys/device_signing/upload` body.
     pub cross_signing: Vec<(String, Box<RawJsonValue>)>,
-    /// `(inbox id, recipient user, event)`, in delivery order.
-    pub to_device: Vec<(i64, String, Box<RawJsonValue>)>,
+    /// `(inbox id, recipient user, recipient device or `*`, event)`, in
+    /// delivery order.
+    pub to_device: Vec<(i64, String, String, Box<RawJsonValue>)>,
     /// `(user, stream_id)`: how many times each local user's device list has
     /// changed, the counter `m.device_list_update` carries so a peer can
     /// order updates and notice a gap.
@@ -900,12 +901,13 @@ pub trait E2eeStore: Send + Sync {
 
     /// Pre:  `id` is unique per process lifetime and increasing (the caller
     ///       seeds its counter from the loaded snapshot's maximum).
-    /// Post: the event waits for `user` under `id`; a repeat of the same id is
-    ///       ignored.
+    /// Post: the event waits for `device` of `user` (`*`: any device) under
+    ///       `id`; a repeat of the same id is ignored.
     async fn push_to_device(
         &self,
         id: i64,
         user: &str,
+        device: &str,
         event: &RawJsonValue,
     ) -> Result<(), StorageError>;
 
@@ -913,6 +915,43 @@ pub trait E2eeStore: Send + Sync {
     /// Post: the named rows are gone; idempotent. Called once the events have
     ///       been handed to a sync response.
     async fn remove_to_device(&self, ids: &[i64]) -> Result<(), StorageError>;
+}
+
+/// Per-user account data: global entries keyed by type, room entries by room
+/// and type. Wire-verbatim JSON; the in-memory copy in `neutrino-http` is the
+/// runtime one and these rows are what it is rebuilt from.
+#[async_trait]
+pub trait AccountDataStore: Send + Sync {
+    /// Pre:  none.
+    /// Post: every `(user, room, type, content)` row; `room` is `None` for a
+    ///       global entry.
+    async fn load_account_data(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, String, Box<RawJsonValue>)>, StorageError>;
+
+    /// Pre:  `content` is a JSON object.
+    /// Post: the `(user, room, type)` row holds `content`, replacing any
+    ///       previous.
+    async fn put_account_data(
+        &self,
+        user: &str,
+        room: Option<&str>,
+        event_type: &str,
+        content: &RawJsonValue,
+    ) -> Result<(), StorageError>;
+}
+
+/// Client sessions of the multi-user shim: access token → user and device.
+/// Persisted so a restart does not sign every client out — the mesh test rig
+/// restarts nodes on purpose.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    /// Post: every `(token, user, device)` row.
+    async fn load_sessions(&self) -> Result<Vec<(String, String, String)>, StorageError>;
+
+    /// Post: `token` resolves to `(user, device)`; a repeat of the same token
+    ///       keeps the first.
+    async fn put_session(&self, token: &str, user: &str, device: &str) -> Result<(), StorageError>;
 }
 
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
@@ -928,6 +967,8 @@ pub trait StorageBackend:
     + InviteStore
     + IdentityStore
     + E2eeStore
+    + AccountDataStore
+    + SessionStore
 {
 }
 
@@ -943,6 +984,8 @@ impl<T> StorageBackend for T where
         + InviteStore
         + IdentityStore
         + E2eeStore
+        + AccountDataStore
+        + SessionStore
 {
 }
 

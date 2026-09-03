@@ -5799,6 +5799,19 @@ async fn send_edus(app: &axum::Router, txn_id: &str, edus: Value) -> StatusCode 
 /// Everything currently sitting in the local to-device inbox, as a client sees
 /// it. `/sync` drains, so a second call returns nothing.
 async fn sync_to_device(app: &axum::Router) -> Vec<Value> {
+    sync_to_device_as(app, "PHONE").await
+}
+
+/// Become `device` (the single-user build's device is whatever the last
+/// login named) and take what the to-device inbox holds for it.
+async fn sync_to_device_as(app: &axum::Router, device: &str) -> Vec<Value> {
+    let (status, _) = post_json(
+        app,
+        "/_matrix/client/v3/login",
+        &json!({ "type": "m.login.password", "user": "alice", "password": "x", "device_id": device }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "login as {device}");
     let req = Request::builder()
         .method("GET")
         .uri("/_matrix/client/v3/sync?timeout=0")
@@ -5810,6 +5823,57 @@ async fn sync_to_device(app: &axum::Router) -> Vec<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Two devices of one user each get their own to-device messages and not
+/// each other's; a `*` message reaches both, once each.
+#[tokio::test]
+async fn each_device_gets_only_its_own_to_device_messages() {
+    let (app, _tmp) = test_router().await;
+    upload_device(&app, alice().as_str(), "PHONE", json!({})).await;
+    upload_device(&app, alice().as_str(), "LAPTOP", json!({})).await;
+
+    let status = send_edus(
+        &app,
+        "edu-devices",
+        json!([{
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": peer_user().as_str(),
+                "type": "m.room_key",
+                "message_id": "m-devices",
+                "messages": { alice().as_str(): {
+                    "PHONE": { "session_id": "for-phone" },
+                    "LAPTOP": { "session_id": "for-laptop" },
+                    "*": { "session_id": "for-everyone" },
+                } },
+            },
+        }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let session_ids = |events: &[Value]| -> Vec<String> {
+        let mut ids: Vec<String> = events
+            .iter()
+            .map(|e| e["content"]["session_id"].as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let phone = sync_to_device_as(&app, "PHONE").await;
+    assert_eq!(session_ids(&phone), ["for-everyone", "for-phone"]);
+    assert!(
+        sync_to_device_as(&app, "PHONE").await.is_empty(),
+        "delivered once"
+    );
+
+    let laptop = sync_to_device_as(&app, "LAPTOP").await;
+    assert_eq!(session_ids(&laptop), ["for-everyone", "for-laptop"]);
+
+    // A device the directory has never heard of has nothing waiting, and a
+    // `*` for a user with no known device waits for whoever turns up.
+    assert!(sync_to_device_as(&app, "TABLET").await.is_empty());
 }
 
 #[tokio::test]

@@ -122,6 +122,7 @@ pub fn synthesize_v5_request(query: &LegacyQuery) -> v5::Request {
     let mut extensions = v5::request::Extensions::default();
     extensions.typing.enabled = Some(true);
     extensions.receipts.enabled = Some(true);
+    extensions.account_data.enabled = Some(true);
     extensions.e2ee.enabled = Some(true);
     req.extensions = extensions;
 
@@ -256,6 +257,32 @@ pub fn translate_response(
         }
     }
 
+    // Account data: global entries at the top level, room entries in the
+    // joined room's `account_data.events` (a bare room entry when the
+    // response carried no event for it).
+    let account_data_events: Vec<Value> = resp
+        .extensions
+        .account_data
+        .global
+        .iter()
+        .filter_map(|raw| serde_json::from_str(raw.json().get()).ok())
+        .collect();
+    for (room_id, entries) in &resp.extensions.account_data.rooms {
+        if !matches!(memberships.get(room_id), Some(Membership::Join)) {
+            continue;
+        }
+        let entry = join
+            .entry(room_id.to_string())
+            .or_insert_with(empty_joined_room_shape);
+        if let Some(Value::Array(events)) = entry.pointer_mut("/account_data/events") {
+            events.extend(
+                entries
+                    .iter()
+                    .filter_map(|raw| serde_json::from_str::<Value>(raw.json().get()).ok()),
+            );
+        }
+    }
+
     json!({
         "next_batch": resp.pos,
         "rooms": {
@@ -265,7 +292,7 @@ pub fn translate_response(
             "knock": Value::Object(knock),
         },
         "presence": {"events": []},
-        "account_data": {"events": []},
+        "account_data": {"events": account_data_events},
         "to_device": {"events": []},
         "device_lists": {
             "changed": resp.extensions.e2ee.device_lists.changed,

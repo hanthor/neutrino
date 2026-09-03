@@ -570,3 +570,38 @@ async fn legacy_sync_carries_device_list_changes_and_key_counts() {
     assert_eq!(body["device_lists"]["left"], json!([]));
     assert_eq!(body["device_one_time_keys_count"]["signed_curve25519"], 1);
 }
+
+/// A write to account data reaches a legacy `/sync` that is already waiting
+/// on it, and a later sync carries only what changed since.
+#[tokio::test]
+async fn legacy_sync_carries_account_data_and_only_changes_after_the_first() {
+    let (app, _tmp) = test_router().await;
+    let me = "@alice:example.org";
+    let (status, first) = get(&app, LEGACY_SYNC_PATH, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["account_data"]["events"], json!([]));
+    let since = first["next_batch"].as_str().unwrap().to_string();
+
+    let (status, _) = put(
+        &app,
+        &format!("/_matrix/client/v3/user/{me}/account_data/m.direct"),
+        &json!({ "@bob:example.org": ["!r:example.org"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get(&app, LEGACY_SYNC_PATH, Some(&format!("since={since}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = body["account_data"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{body}");
+    assert_eq!(events[0]["type"], "m.direct");
+    let since = body["next_batch"].as_str().unwrap().to_string();
+
+    let (status, body) = get(&app, LEGACY_SYNC_PATH, Some(&format!("since={since}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["account_data"]["events"],
+        json!([]),
+        "nothing new: {body}"
+    );
+}
