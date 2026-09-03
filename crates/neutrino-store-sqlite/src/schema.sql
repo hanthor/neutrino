@@ -498,6 +498,16 @@ CREATE TABLE one_time_keys (
     PRIMARY KEY (user, device, key_id)
 ) STRICT, WITHOUT ROWID;
 
+-- A local user's device-list stream: bumped on every device change and sent
+-- in `m.device_list_update`, so a peer can order our updates and notice a
+-- gap. Persisted because a restart that reset it would look, to a peer, like
+-- an update from the past.
+CREATE TABLE device_streams (
+    user      TEXT NOT NULL,
+    stream_id INTEGER NOT NULL,
+    PRIMARY KEY (user)
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE cross_signing_keys (
     name   TEXT NOT NULL PRIMARY KEY,
     value  TEXT NOT NULL

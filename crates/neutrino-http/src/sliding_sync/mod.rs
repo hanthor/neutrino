@@ -27,6 +27,7 @@ use crate::e2ee::E2eeState;
 use crate::ephemeral::EphemeralState;
 use neutrino_store::{StorageBackend, StorageError};
 use ruma::OneTimeKeyAlgorithm;
+use ruma::OwnedUserId;
 use ruma::UInt;
 use ruma::UserId;
 use ruma::api::client::sync::sync_events::v5;
@@ -235,6 +236,10 @@ pub async fn handle<S: StorageBackend>(
     let ephemeral_at_start = state.ephemeral.version();
     let wants_ephemeral = req.extensions.typing.enabled == Some(true)
         || req.extensions.receipts.enabled == Some(true);
+    // Device-list changes: a peer's new device is data for a client that
+    // opted into e2ee, with no room event behind it.
+    let wants_e2ee = req.extensions.e2ee.enabled == Some(true);
+    let device_seq_at_start = state.e2ee.device_seq();
 
     // Short wait while the prior holder (if any) observes the cancel above
     // and unwinds.
@@ -287,6 +292,7 @@ pub async fn handle<S: StorageBackend>(
             || has_data(&resp)
             || has_to_device(state, user_id, &extensions_req)
             || (wants_ephemeral && state.ephemeral.version() != ephemeral_at_start)
+            || (wants_e2ee && state.e2ee.device_seq() != device_seq_at_start)
         {
             break resp;
         }
@@ -318,7 +324,7 @@ pub async fn handle<S: StorageBackend>(
             tokio::select! {
                 _ = rx.changed() => {}
                 _ = delivery_rx.changed(), if state.delivery_receipts => {}
-                _ = e2ee_rx.changed(), if extensions_req.to_device.enabled == Some(true) => {}
+                _ = e2ee_rx.changed(), if extensions_req.to_device.enabled == Some(true) || wants_e2ee => {}
                 _ = ephemeral_rx.changed(), if wants_ephemeral => {}
             }
         };
@@ -479,6 +485,18 @@ fn has_to_device<S>(
     req_ext.to_device.enabled == Some(true) && state.e2ee.pending_to_device(user_id.as_str()) > 0
 }
 
+/// Everyone who shares a joined room with `user_id`, the caller included.
+async fn shared_room_members<S: StorageBackend>(
+    state: &SyncState<S>,
+    user_id: &UserId,
+) -> Result<std::collections::BTreeSet<OwnedUserId>, SyncError> {
+    let mut members = std::collections::BTreeSet::new();
+    for room in state.store.joined_rooms(user_id).await? {
+        members.extend(state.store.joined_members(&room).await?.into_keys());
+    }
+    Ok(members)
+}
+
 /// Fill the e2ee / to_device extensions the client opted into.
 ///
 /// `to_device` **drains** the inbox: Matrix delivers a to-device message once,
@@ -509,6 +527,23 @@ async fn populate_extensions<S: StorageBackend>(
             );
         }
         e2ee.device_unused_fallback_key_types = Some(Vec::new());
+        // Users whose device list changed since this connection last looked,
+        // among those sharing a room with the caller: the cue to fetch their
+        // keys again before the next message is encrypted to a device that
+        // no longer exists.
+        let now = state.e2ee.device_seq();
+        let changed = state.e2ee.device_changes_since(conn.device_list_pos);
+        if !changed.is_empty() {
+            let shared = shared_room_members(state, user_id).await?;
+            for user in changed {
+                if let Ok(id) = OwnedUserId::try_from(user.as_str())
+                    && shared.contains(&id)
+                {
+                    e2ee.device_lists.changed.push(id);
+                }
+            }
+        }
+        conn.device_list_pos = now;
         resp.extensions.e2ee = e2ee;
     }
     if req_ext.typing.enabled == Some(true) {

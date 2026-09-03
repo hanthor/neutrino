@@ -78,6 +78,17 @@ impl E2eeStore for SqliteStore {
                 snapshot.to_device.push((id, user, raw(event)?));
             }
 
+            let mut stmt = conn.prepare("SELECT user, stream_id FROM device_streams")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for r in rows {
+                let (user, stream_id) = r?;
+                snapshot
+                    .device_streams
+                    .push((user, u64::try_from(stream_id).unwrap_or(0)));
+            }
+
             Ok(snapshot)
         })
         .await
@@ -160,6 +171,20 @@ impl E2eeStore for SqliteStore {
                 "INSERT INTO cross_signing_keys (name, value) VALUES (?, ?) \
                  ON CONFLICT (name) DO UPDATE SET value = excluded.value",
                 params![name, value],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn put_device_stream(&self, user: &str, stream_id: u64) -> Result<(), StorageError> {
+        let user = user.to_owned();
+        let stream_id = i64::try_from(stream_id).unwrap_or(i64::MAX);
+        self.run_write(move |conn| -> Result<(), Error> {
+            conn.execute(
+                "INSERT INTO device_streams (user, stream_id) VALUES (?, ?) \
+                 ON CONFLICT (user) DO UPDATE SET stream_id = excluded.stream_id",
+                params![user, stream_id],
             )?;
             Ok(())
         })

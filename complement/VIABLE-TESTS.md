@@ -34,7 +34,7 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 - No `POST /user/{uid}/filter` (+ `GET …/filter/{id}`) — blocks the large filtered-`/sync` tranche.
 - No `/joined_members`, `/joined_rooms`, `/publicRooms`, `/directory/room/{alias}` (no room directory).
 - No `/forget`, `/upgrade`, profile/displayname/avatar writes, account_data writes (so no `/read_markers`).
-- No `/devices` management, no `m.device_list_update` (so no `device_lists.changed` in sync).
+- No `/devices` management. (`m.device_list_update` and `device_lists.changed` landed 2026-09-03 for device changes; membership-driven `changed`/`left` are not derived — see the allowlist's last block.)
 - 404 fallback returns plain text, not `{"errcode":"M_UNRECOGNIZED"}`.
 - No presence / push rules; no working cross-server federation join.
 

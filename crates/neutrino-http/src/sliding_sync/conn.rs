@@ -106,6 +106,11 @@ pub struct Conn {
     /// as an empty notice rather than by omission. `0` on a fresh connection:
     /// every room that has ever had a notice is reported once.
     pub ephemeral_version: u64,
+    /// The device-change log position this connection last rendered into
+    /// `device_lists.changed`. Users who changed after it are reported on the
+    /// next e2ee extension; `0` on a fresh connection reports everyone who
+    /// has ever changed, which is the initial sync a client expects.
+    pub device_list_pos: u64,
     pub lists: BTreeMap<String, ListCfg>,
     pub subs: BTreeMap<OwnedRoomId, SubCfg>,
     pub sent: HashMap<OwnedRoomId, RoomSent>,

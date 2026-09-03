@@ -466,7 +466,13 @@ async fn extension_e2ee_reports_the_real_one_time_key_count() {
 
     // Upload two one-time keys for the local user's device; the count follows.
     let upload = json!({
-        "device_keys": { "device_id": "PHONE", "keys": {} },
+        "device_keys": {
+            "user_id": "@alice:example.org",
+            "device_id": "PHONE",
+            "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+            "keys": {},
+            "signatures": {},
+        },
         "one_time_keys": {
             "signed_curve25519:k1": { "key": "one" },
             "signed_curve25519:k2": { "key": "two" },

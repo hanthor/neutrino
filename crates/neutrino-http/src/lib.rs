@@ -598,6 +598,7 @@ fn build_router(state: &AppState) -> Router {
         .route("/_matrix/client/v3/keys/query", post(keys_query))
         .route("/_matrix/client/v3/keys/upload", post(keys_upload))
         .route("/_matrix/client/v3/keys/claim", post(keys_claim))
+        .route("/_matrix/client/v3/keys/changes", get(keys_changes))
         .route(
             "/_matrix/client/v3/sendToDevice/{event_type}/{txn_id}",
             put(send_to_device),
@@ -909,6 +910,28 @@ async fn get_login() -> Json<Value> {
     }))
 }
 
+/// The device id a register or login gets when the request names none.
+/// Under the multi-user shim every login is a distinct device, as on a real
+/// homeserver, so device-list changes and multi-device key queries can be
+/// exercised; the single-user build keeps the one conventional id, which is
+/// what the embedded node's own client expects.
+#[cfg(feature = "multi-user-shim")]
+fn fresh_device_id() -> String {
+    use rand::Rng;
+    use rand::distr::Alphanumeric;
+    let suffix: String = rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(10)
+        .map(|c| char::from(c).to_ascii_uppercase())
+        .collect();
+    format!("DEV{suffix}")
+}
+
+#[cfg(not(feature = "multi-user-shim"))]
+fn fresh_device_id() -> String {
+    "DEVICEID".to_owned()
+}
+
 async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode, Json<Value>) {
     // No `auth` block — initiate UIA so the client knows which flows to attempt.
     if body.0.get("auth").is_none() {
@@ -926,8 +949,9 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
         .0
         .pointer("/device_id")
         .and_then(|v| v.as_str())
-        .unwrap_or("DEVICEID")
-        .to_string();
+        .filter(|d| !d.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(fresh_device_id);
 
     #[cfg(feature = "multi-user-shim")]
     {
@@ -985,10 +1009,7 @@ async fn post_register(state: State<AppState>, body: Json<Value>) -> (StatusCode
     }
 }
 
-async fn post_login(
-    state: State<AppState>,
-    #[cfg(feature = "multi-user-shim")] body: Json<Value>,
-) -> (StatusCode, Json<Value>) {
+async fn post_login(state: State<AppState>, body: Json<Value>) -> (StatusCode, Json<Value>) {
     info!("Logged in");
 
     #[cfg(feature = "multi-user-shim")]
@@ -1019,7 +1040,13 @@ async fn post_login(
                     "user_id": user_id,
                     "access_token": token,
                     "home_server": server_name,
-                    "device_id": "DEVICEID",
+                    "device_id": body
+                        .0
+                        .pointer("/device_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(fresh_device_id),
                 })),
             ),
             // Mirror `/register`: a malformed identifier is a 400, not a 200
@@ -1041,7 +1068,16 @@ async fn post_login(
                 "user_id": app.config.user_id(),
                 "access_token": "syt_1234567890abcdef",
                 "home_server": app.config.server_name,
-                "device_id": "DEVICEID",
+                // The device the client names is the device it gets — a
+                // reinstalled client picks a new id so it is a new device,
+                // not the old one with keys that no longer match.
+                "device_id": body
+                    .0
+                    .pointer("/device_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(fresh_device_id),
             })),
         )
     }
@@ -1593,16 +1629,117 @@ async fn keys_upload(
         .unwrap_or("DEVICEID")
         .to_owned();
 
-    let mut inner = e2ee.lock();
+    let counts = {
+        let mut inner = e2ee.lock();
+        if let Some(keys) = device_keys {
+            inner.keys.put_device(&user, &device, keys.clone());
+        }
+        if let Some(one_time) = body.pointer("/one_time_keys").and_then(Value::as_object) {
+            inner.keys.put_one_time_keys(&user, &device, one_time);
+        }
+        inner.keys.one_time_key_counts(&user, &device)
+    };
+
+    // A new or changed device is a device-list change: local clients hear
+    // of it under `device_lists.changed`, and every server sharing a room
+    // with this user gets an `m.device_list_update` through the durable
+    // outbox, so a peer that is out of range encrypts to the new device the
+    // moment the link heals rather than to a device that is gone.
     if let Some(keys) = device_keys {
-        inner.keys.put_device(&user, &device, keys.clone());
-    }
-    if let Some(one_time) = body.pointer("/one_time_keys").and_then(Value::as_object) {
-        inner.keys.put_one_time_keys(&user, &device, one_time);
+        let stream_id = e2ee.note_device_change(&user, true);
+        let (our_name, store) = {
+            let app = lock_app(&state.0);
+            (app.config.server_name.clone(), app.store.clone())
+        };
+        let edu = json!({
+            "edu_type": "m.device_list_update",
+            "content": {
+                "user_id": user,
+                "device_id": device,
+                "stream_id": stream_id,
+                "prev_id": [],
+                "deleted": false,
+                "keys": keys,
+            },
+        });
+        if let Err(e) = fan_out_edu_to_peers(
+            &store,
+            &caller,
+            &our_name,
+            &format!("dlu-{user}-{stream_id}"),
+            &edu,
+        )
+        .await
+        {
+            warn!(error = %e, "queueing m.device_list_update");
+        }
     }
 
-    let counts = inner.keys.one_time_key_counts(&user, &device);
     Json(json!({ "one_time_key_counts": counts })).into_response()
+}
+
+/// `GET /keys/changes?from&to` — users whose device list changed between two
+/// sync tokens. Legacy tokens here are per-connection positions with no
+/// device-log coordinate behind them, so this answers with every user sharing
+/// a room with the caller whose devices have changed at all: a superset of
+/// the exact answer, and safe, since the only thing a client does with the
+/// list is fetch those users' keys again.
+async fn keys_changes(
+    state: State<AppState>,
+    AuthUser(caller): AuthUser,
+) -> axum::response::Response {
+    let (store, e2ee) = {
+        let app = lock_app(&state.0);
+        (app.store.clone(), app.e2ee.clone())
+    };
+    let mut shared = std::collections::BTreeSet::new();
+    let rooms = match store.joined_rooms(&caller).await {
+        Ok(rooms) => rooms,
+        Err(e) => return storage_error(e),
+    };
+    for room in rooms {
+        match store.joined_members(&room).await {
+            Ok(members) => shared.extend(members.into_keys()),
+            Err(e) => return storage_error(e),
+        }
+    }
+    let changed: Vec<String> = e2ee
+        .device_changes_since(0)
+        .into_iter()
+        .filter(|u| ruma::OwnedUserId::try_from(u.as_str()).is_ok_and(|id| shared.contains(&id)))
+        .collect();
+    Json(json!({ "changed": changed, "left": [] })).into_response()
+}
+
+fn storage_error(e: StorageError) -> axum::response::Response {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "M_UNKNOWN",
+        &e.to_string(),
+    )
+}
+
+/// Queue one EDU for every server that shares a room with `user` — the
+/// audience of a device-list update, which is not room-scoped.
+async fn fan_out_edu_to_peers(
+    store: &SqliteStore,
+    user: &ruma::UserId,
+    our_name: &str,
+    edu_id: &str,
+    edu: &Value,
+) -> Result<(), StorageError> {
+    let mut servers: Vec<ruma::OwnedServerName> = Vec::new();
+    for room in store.joined_rooms(user).await? {
+        servers.extend(member_servers(store, &room, our_name).await?);
+    }
+    servers.sort();
+    servers.dedup();
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let raw =
+        serde_json::value::to_raw_value(edu).expect("an EDU built from json! always serializes");
+    store.enqueue_edu(&servers, edu_id, &raw).await
 }
 
 async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Json<Value> {

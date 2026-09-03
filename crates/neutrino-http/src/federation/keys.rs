@@ -103,10 +103,9 @@ pub(crate) async fn claim(
 /// for one of our users, which is how a peer discovers devices it was never
 /// told about rather than having to guess device ids.
 ///
-/// `stream_id` is required by the spec and is meant to order device-list
-/// updates. We have no device-list stream (nothing here ever revokes a device),
-/// so it is a constant: a peer using it to detect staleness will conclude our
-/// list never changes, which is true of this implementation.
+/// `stream_id` is the user's device-list stream: bumped on every change and
+/// carried in `m.device_list_update`, so a peer comparing the two knows
+/// whether it has missed an update.
 pub(crate) async fn devices(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -133,7 +132,7 @@ pub(crate) async fn devices(
         .collect::<Vec<_>>();
     let mut response = json!({
         "user_id": user.as_str(),
-        "stream_id": 1,
+        "stream_id": inner.keys.device_stream(user.as_str()),
         "devices": devices,
     });
     // Cross-signing keys ride along under the names the spec gives them here,

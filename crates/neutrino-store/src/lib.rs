@@ -841,6 +841,10 @@ pub struct E2eeSnapshot {
     pub cross_signing: Vec<(String, Box<RawJsonValue>)>,
     /// `(inbox id, recipient user, event)`, in delivery order.
     pub to_device: Vec<(i64, String, Box<RawJsonValue>)>,
+    /// `(user, stream_id)`: how many times each local user's device list has
+    /// changed, the counter `m.device_list_update` carries so a peer can
+    /// order updates and notice a gap.
+    pub device_streams: Vec<(String, u64)>,
 }
 
 /// Durable home for the server's share of E2EE. On a phone the app is killed
@@ -890,6 +894,9 @@ pub trait E2eeStore: Send + Sync {
     ///       previous.
     async fn put_cross_signing(&self, name: &str, value: &RawJsonValue)
     -> Result<(), StorageError>;
+
+    /// Record a local user's device-list `stream_id` after a change.
+    async fn put_device_stream(&self, user: &str, stream_id: u64) -> Result<(), StorageError>;
 
     /// Pre:  `id` is unique per process lifetime and increasing (the caller
     ///       seeds its counter from the loaded snapshot's maximum).

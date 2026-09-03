@@ -122,6 +122,7 @@ pub fn synthesize_v5_request(query: &LegacyQuery) -> v5::Request {
     let mut extensions = v5::request::Extensions::default();
     extensions.typing.enabled = Some(true);
     extensions.receipts.enabled = Some(true);
+    extensions.e2ee.enabled = Some(true);
     req.extensions = extensions;
 
     req
@@ -266,8 +267,11 @@ pub fn translate_response(
         "presence": {"events": []},
         "account_data": {"events": []},
         "to_device": {"events": []},
-        "device_lists": {"changed": [], "left": []},
-        "device_one_time_keys_count": {},
+        "device_lists": {
+            "changed": resp.extensions.e2ee.device_lists.changed,
+            "left": resp.extensions.e2ee.device_lists.left,
+        },
+        "device_one_time_keys_count": resp.extensions.e2ee.device_one_time_keys_count,
     })
 }
 

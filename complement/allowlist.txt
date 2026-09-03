@@ -130,3 +130,13 @@ TestUploadKeyIdempotency$
 TestUploadKeyIdempotencyOverlap$
 TestKeyClaimOrdering$
 TestKeysQueryWithDeviceIDAsObjectFails$
+
+# Device-list updates (2026-09-03): a device change is announced to peers as
+# `m.device_list_update` and to clients under `device_lists.changed`, and a
+# login that names no device gets a fresh one under the shim. Not viable:
+# `TestDeviceListUpdates` — its local subtests expect `device_lists.changed`
+# and `.left` to follow room membership (a user newly sharing, or no longer
+# sharing, an encrypted room), which this server does not derive; clients
+# built on matrix-sdk-crypto track room members themselves, so nothing we
+# ship depends on it.
+TestKeyChangesLocal$

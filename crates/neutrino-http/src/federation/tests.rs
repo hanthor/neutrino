@@ -6511,3 +6511,151 @@ async fn inbound_typing_and_receipt_edus_are_applied() {
     assert_eq!(receipt.event_id, join_id);
     assert_eq!(receipt.ts, 77);
 }
+
+// === Device-list updates ==================================================
+
+/// A room alice created that `peer_user()` has joined, straight into the
+/// store: the shape every device-list audience question starts from.
+async fn room_shared_with_peer(store: &SqliteStore) -> OwnedRoomId {
+    let create = EventBuilder::new(
+        alice(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let join = EventBuilder::new(
+        alice(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(alice().as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let peer_join = EventBuilder::new(
+        peer_user(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(peer_user().as_str().to_owned())
+    .content(json!({ "membership": "join" }))
+    .prev_events(vec![join.event_id.clone()])
+    .prev_state_events(vec![join.event_id.clone()])
+    .build()
+    .unwrap();
+    store
+        .create_room(&create, &[join, peer_join])
+        .await
+        .unwrap();
+    room_id
+}
+
+#[tokio::test]
+async fn key_upload_announces_a_device_list_update_to_peers() {
+    // A new device is a device-list change: every server sharing a room
+    // with the user is told through the durable outbox, with a stream id
+    // that counts the user's changes, and the federation device list
+    // reports the same id so a peer can tell whether it missed one.
+    let (store, _tmp) = fresh_store().await;
+    room_shared_with_peer(&store).await;
+    let app = router_with_store(config(), store.clone());
+
+    upload_device(&app, alice().as_str(), "PHONE", json!({})).await;
+    upload_device(&app, alice().as_str(), "LAPTOP", json!({})).await;
+
+    let dest: &ServerName = TEST_PEER.try_into().unwrap();
+    let queued = store.pending_edus(dest, usize::MAX).await.unwrap();
+    let updates: Vec<Value> = queued
+        .iter()
+        .map(|e| serde_json::from_str(e.raw.get()).unwrap())
+        .filter(|e: &Value| e["edu_type"] == "m.device_list_update")
+        .collect();
+    assert_eq!(updates.len(), 2, "one update per device change");
+    assert_eq!(updates[0]["content"]["user_id"], alice().as_str());
+    assert_eq!(updates[0]["content"]["device_id"], "PHONE");
+    assert_eq!(updates[0]["content"]["stream_id"], 1);
+    assert_eq!(updates[0]["content"]["deleted"], false);
+    assert!(
+        updates[0]["content"]["keys"]["keys"].is_object(),
+        "keys ride along"
+    );
+    assert_eq!(updates[1]["content"]["stream_id"], 2);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/_matrix/federation/v1/user/devices/{}", alice()))
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = drive(&app, req).await;
+    assert_eq!(body["stream_id"], 2);
+}
+
+#[tokio::test]
+async fn inbound_device_list_update_marks_the_peer_changed() {
+    // A peer's update is the cue for our clients to fetch their keys again:
+    // it lands in the change log and `/keys/changes` reports it to anyone
+    // sharing a room. An update naming one of our own users is dropped.
+    let (store, _tmp) = fresh_store().await;
+    room_shared_with_peer(&store).await;
+    let state = crate::AppState::from_store(config(), store.clone());
+    let app = crate::build_router(&state);
+
+    let status = send_edus(
+        &app,
+        "dlu-1",
+        json!([
+            {
+                "edu_type": "m.device_list_update",
+                "content": { "user_id": peer_user().as_str(), "device_id": "P1", "stream_id": 7, "deleted": false },
+            },
+            {
+                "edu_type": "m.device_list_update",
+                "content": { "user_id": alice().as_str(), "device_id": "X", "stream_id": 1, "deleted": false },
+            },
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let e2ee = crate::lock_app(&state).e2ee.clone();
+    assert_eq!(e2ee.device_changes_since(0), vec![peer_user().to_string()]);
+
+    let (status, body) = get(&app, "/_matrix/client/v3/keys/changes?from=a&to=b").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["changed"], json!([peer_user().as_str()]));
+    assert_eq!(body["left"], json!([]));
+}
+
+#[tokio::test]
+async fn device_stream_survives_a_restart() {
+    // A restart that reset the stream would look, to a peer, like updates
+    // from the past: the counter is persisted with the keys.
+    let (store, _tmp) = fresh_store().await;
+    let first = crate::AppState::from_store(config(), store.clone());
+    let app = crate::build_router(&first);
+    upload_device(&app, alice().as_str(), "PHONE", json!({})).await;
+    upload_device(&app, alice().as_str(), "LAPTOP", json!({})).await;
+    wait_for_persisted(&store, |s| {
+        s.device_streams == vec![(alice().to_string(), 2)]
+    })
+    .await;
+
+    let second = crate::AppState::from_store(config(), store.clone());
+    second.load_e2ee().await.unwrap();
+    let app = crate::build_router(&second);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/_matrix/federation/v1/user/devices/{}", alice()))
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = drive(&app, req).await;
+    assert_eq!(body["stream_id"], 2, "stream continues where it left off");
+}

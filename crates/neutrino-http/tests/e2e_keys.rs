@@ -132,3 +132,38 @@ async fn well_formed_upload_round_trips_through_query() {
         "stored device_keys should be echoed back, got {body}"
     );
 }
+
+/// The device id a client names at login is the one it gets, so a
+/// reinstalled client — new store, new id — is a new device rather than the
+/// old one with keys that no longer match; a login naming none keeps the
+/// single-user build's conventional id.
+#[tokio::test]
+async fn login_honours_the_device_id_the_client_names() {
+    async fn login(app: &axum::Router, body: &Value) -> Value {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_matrix/client/v3/login")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(resp.status().is_success(), "login: {}", resp.status());
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let (app, _tmp) = test_router().await;
+    let named = login(
+        &app,
+        &json!({ "type": "m.login.password", "user": "alice", "password": "x", "device_id": "IFNEWPHONE" }),
+    )
+    .await;
+    let unnamed = login(
+        &app,
+        &json!({ "type": "m.login.password", "user": "alice", "password": "x" }),
+    )
+    .await;
+    assert_eq!(named["device_id"], "IFNEWPHONE");
+    assert_eq!(unnamed["device_id"], "DEVICEID");
+}

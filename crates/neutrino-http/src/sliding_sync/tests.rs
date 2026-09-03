@@ -3540,3 +3540,114 @@ async fn receipts_extension_carries_real_read_receipts() {
         serde_json::json!(1234)
     );
 }
+
+/// A room `user` created that `peer` has joined.
+async fn room_shared_with(store: &Arc<SqliteStore>, user: &UserId, peer: &UserId) -> OwnedRoomId {
+    let create = neutrino_event::event_builder::EventBuilder::new(
+        user.to_owned(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let join = neutrino_event::event_builder::EventBuilder::new(
+        user.to_owned(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(user.as_str().to_owned())
+    .content(serde_json::json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    let peer_join = neutrino_event::event_builder::EventBuilder::new(
+        peer.to_owned(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(peer.as_str().to_owned())
+    .content(serde_json::json!({ "membership": "join" }))
+    .prev_events(vec![join.event_id.clone()])
+    .prev_state_events(vec![join.event_id.clone()])
+    .build()
+    .unwrap();
+    store
+        .create_room(&create, &[join, peer_join])
+        .await
+        .unwrap();
+    room_id
+}
+
+fn e2ee_request() -> Request {
+    let mut req = Request::new();
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(9u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    req.lists.insert("all".to_owned(), list);
+    req.extensions.e2ee.enabled = Some(true);
+    req
+}
+
+#[tokio::test]
+async fn e2ee_extension_reports_a_device_list_change_once() {
+    let (store, _tmp) = fresh_store().await;
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let me = user_id!("@alice:example.org");
+    let peer = user_id!("@peer:remote.example.org");
+    let stranger = user_id!("@nobody:remote.example.org");
+    room_shared_with(&store, me, peer).await;
+
+    state.e2ee.note_device_change(peer.as_str(), false);
+    state.e2ee.note_device_change(stranger.as_str(), false);
+
+    let resp = handle(&state, me, e2ee_request()).await.unwrap();
+    assert_eq!(
+        resp.extensions.e2ee.device_lists.changed,
+        vec![peer.to_owned()],
+        "only users sharing a room are reported"
+    );
+
+    let mut next = e2ee_request();
+    next.pos = Some(resp.pos.clone());
+    let resp = handle(&state, me, next).await.unwrap();
+    assert!(
+        resp.extensions.e2ee.device_lists.changed.is_empty(),
+        "reported once, not on every sync"
+    );
+}
+
+#[tokio::test]
+async fn a_device_list_change_wakes_a_long_poll() {
+    let (store, _tmp) = fresh_store().await;
+    let state = Arc::new(SyncState::new(store.clone(), no_shutdown()));
+    let me = user_id!("@alice:example.org");
+    let peer = user_id!("@peer:remote.example.org");
+    room_shared_with(&store, me, peer).await;
+
+    let initial = handle(&state, me, e2ee_request()).await.unwrap();
+    let mut req = e2ee_request();
+    req.pos = Some(initial.pos.clone());
+    req.timeout = Some(std::time::Duration::from_secs(10));
+    let poll = {
+        let state = state.clone();
+        tokio::spawn(async move { handle(&state, me, req).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    state.e2ee.note_device_change(peer.as_str(), false);
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(3), poll)
+        .await
+        .expect("long-poll woke on the device-list change")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resp.extensions.e2ee.device_lists.changed,
+        vec![peer.to_owned()]
+    );
+}

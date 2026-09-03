@@ -535,3 +535,38 @@ async fn legacy_sync_carries_typing_and_receipts_as_ephemeral_events() {
         "own read receipt: {receipt}"
     );
 }
+
+/// A device change reaches a legacy client under the top-level
+/// `device_lists.changed`, alongside its own one-time key counts.
+#[tokio::test]
+async fn legacy_sync_carries_device_list_changes_and_key_counts() {
+    let (app, _tmp) = test_router().await;
+    let (status, body) = post(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["room_id"].is_string());
+    let (status, _) = post(
+        &app,
+        "/_matrix/client/v3/keys/upload",
+        &json!({
+            "device_keys": {
+                "user_id": "@alice:example.org",
+                "device_id": "DEVICEID",
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                "keys": { "curve25519:DEVICEID": "c", "ed25519:DEVICEID": "e" },
+                "signatures": { "@alice:example.org": { "ed25519:DEVICEID": "sig" } },
+            },
+            "one_time_keys": { "signed_curve25519:a": { "key": "k" } },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "upload");
+
+    let (status, body) = get(&app, LEGACY_SYNC_PATH, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["device_lists"]["changed"],
+        json!(["@alice:example.org"])
+    );
+    assert_eq!(body["device_lists"]["left"], json!([]));
+    assert_eq!(body["device_one_time_keys_count"]["signed_curve25519"], 1);
+}

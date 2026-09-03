@@ -391,6 +391,10 @@ fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
                 apply_receipts(state, edu.get("content"));
                 continue;
             }
+            Some("m.device_list_update") => {
+                apply_device_list_update(state, our_name, edu.get("content"));
+                continue;
+            }
             _ => continue,
         }
         let content = edu.get("content");
@@ -431,6 +435,28 @@ fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
             }
         }
     }
+}
+
+/// `m.device_list_update` content: `{ user_id, device_id, stream_id, ... }`.
+/// A peer's user changed a device, so every client here that shares a room
+/// with them is told under `device_lists.changed` and fetches keys again —
+/// which goes to the peer over federation, so nothing is cached to refresh.
+/// An update naming one of our own users is a peer's mistake, and dropped.
+fn apply_device_list_update(state: &AppState, our_name: &str, content: Option<&serde_json::Value>) {
+    let Some(user) = content
+        .and_then(|c| c.get("user_id"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let ours =
+        ruma::OwnedUserId::try_from(user).is_ok_and(|u| u.server_name().as_str() == our_name);
+    if ours {
+        warn!(%user, "dropping a device-list update for a user we own");
+        return;
+    }
+    let e2ee = lock_app(state).e2ee.clone();
+    e2ee.note_device_change(user, false);
 }
 
 /// `m.typing` content: `{ room_id, user_id, typing }`. The notice is kept only

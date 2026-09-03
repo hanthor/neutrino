@@ -61,6 +61,10 @@ pub(crate) enum Op {
     RemoveToDevice {
         ids: Vec<i64>,
     },
+    SetDeviceStream {
+        user: String,
+        stream_id: u64,
+    },
 }
 
 fn raw(value: &Value) -> Box<RawJsonValue> {
@@ -83,6 +87,17 @@ pub(crate) struct KeyStore {
     pub(crate) one_time_keys: BTreeMap<String, BTreeMap<String, IndexMap<String, Value>>>,
     /// Cross-signing keys, merged as uploaded and echoed back on query.
     pub(crate) cross_signing: serde_json::Map<String, Value>,
+    /// `device_streams[user] -> stream_id`: how many times a local user's
+    /// device list has changed. Carried in `m.device_list_update` so a peer
+    /// can order our updates and notice a gap; persisted for that reason.
+    pub(crate) device_streams: BTreeMap<String, u64>,
+    /// Every device-list change this node has learnt of, local or remote, as
+    /// `(seq, user)` in the order it happened. A sync connection remembers
+    /// the `seq` it last served and reports the users after it under
+    /// `device_lists.changed` — the cue for a client to fetch keys again.
+    pub(crate) device_changes: Vec<(u64, String)>,
+    /// The last `seq` handed out.
+    pub(crate) device_seq: u64,
     /// Where every mutation is written through to, when persistence is
     /// attached. `None` in unit tests that want memory only.
     journal: Option<mpsc::UnboundedSender<Op>>,
@@ -109,6 +124,44 @@ impl KeyStore {
             .entry(user.to_owned())
             .or_default()
             .insert(device.to_owned(), keys);
+    }
+
+    /// Note that `user`'s device list changed. For one of our own users the
+    /// stream advances and is journaled, and the new `stream_id` is returned
+    /// for the `m.device_list_update` that announces it; for a peer's user
+    /// (`local = false`) only the change log moves, since their server owns
+    /// their stream.
+    pub(crate) fn note_device_change(&mut self, user: &str, local: bool) -> u64 {
+        self.device_seq += 1;
+        self.device_changes.push((self.device_seq, user.to_owned()));
+        if !local {
+            return 0;
+        }
+        let stream = self.device_streams.entry(user.to_owned()).or_default();
+        *stream += 1;
+        let stream_id = *stream;
+        self.journal(Op::SetDeviceStream {
+            user: user.to_owned(),
+            stream_id,
+        });
+        stream_id
+    }
+
+    /// A local user's device-list `stream_id`; `0` before any change.
+    pub(crate) fn device_stream(&self, user: &str) -> u64 {
+        self.device_streams.get(user).copied().unwrap_or(0)
+    }
+
+    /// Users whose device list changed after `since`, oldest first, each
+    /// once.
+    pub(crate) fn device_changes_since(&self, since: u64) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (seq, user) in &self.device_changes {
+            if *seq > since && !out.contains(user) {
+                out.push(user.clone());
+            }
+        }
+        out
     }
 
     /// Store a cross-signing section as uploaded; echoed back on query.
@@ -345,6 +398,9 @@ impl E2eeState {
                     .insert(device.clone(), keys);
             }
         }
+        for (user, stream_id) in &snapshot.device_streams {
+            inner.keys.device_streams.insert(user.clone(), *stream_id);
+        }
         for (user, device, key_id, key) in &snapshot.one_time_keys {
             if let Some(key) = parse(key) {
                 inner
@@ -408,6 +464,9 @@ impl E2eeState {
                         store.push_to_device(*id, user, event).await
                     }
                     Op::RemoveToDevice { ids } => store.remove_to_device(ids).await,
+                    Op::SetDeviceStream { user, stream_id } => {
+                        store.put_device_stream(user, *stream_id).await
+                    }
                 };
                 if let Err(e) = result {
                     error!(error = %e, ?op, "persisting E2EE state");
@@ -458,6 +517,27 @@ impl E2eeState {
         let ids: Vec<i64> = drained.iter().map(|(id, _)| *id).collect();
         inner.keys.journal(Op::RemoveToDevice { ids });
         drained.into_iter().map(|(_, event)| event).collect()
+    }
+
+    /// Record a device-list change and wake every sync waiting on this
+    /// state: a client that learns of it now can fetch the new keys before
+    /// its next message, not after. Returns the user's new `stream_id`
+    /// (`0` for a peer's user).
+    pub(crate) fn note_device_change(&self, user: &str, local: bool) -> u64 {
+        let stream_id = self.lock().keys.note_device_change(user, local);
+        self.changed.send_modify(|n| *n += 1);
+        stream_id
+    }
+
+    /// The change-log position now; a sync remembers it and asks for what
+    /// came after.
+    pub(crate) fn device_seq(&self) -> u64 {
+        self.lock().keys.device_seq
+    }
+
+    /// Users whose device list changed after `since`.
+    pub(crate) fn device_changes_since(&self, since: u64) -> Vec<String> {
+        self.lock().keys.device_changes_since(since)
     }
 
     /// How many to-device events wait for `user` — what a long-poll checks to
