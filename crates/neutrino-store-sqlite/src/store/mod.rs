@@ -9,6 +9,7 @@ mod events;
 mod identity;
 mod inbox;
 mod invites;
+mod media;
 mod outbox;
 mod rooms;
 mod sessions;

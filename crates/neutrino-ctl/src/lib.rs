@@ -109,7 +109,16 @@ pub struct Config {
     /// `DeliveryStore`), so flipping this on takes effect immediately rather
     /// than from the next delivery onwards.
     pub delivery_receipts: bool,
+    /// Largest media upload the content repository accepts, in bytes, and the
+    /// largest it will fetch from a peer. Advertised as `m.upload.size` so a
+    /// client can refuse before any bytes cross the link. Default 256 KiB:
+    /// a mesh hop is a BLE link, and a photo that size still reads fine on a
+    /// phone. `NEUTRINO_MEDIA_MAX_BYTES` overrides.
+    pub media_max_bytes: usize,
 }
+
+/// See [`Config::media_max_bytes`].
+pub const DEFAULT_MEDIA_MAX_BYTES: usize = 256 * 1024;
 
 impl Default for Config {
     fn default() -> Self {
@@ -126,6 +135,7 @@ impl Default for Config {
             trusted_network: true,
             log_dir: None,
             delivery_receipts: false,
+            media_max_bytes: DEFAULT_MEDIA_MAX_BYTES,
         }
     }
 }
@@ -172,6 +182,11 @@ impl Config {
             // the field docs — the receipts are synthesised, not real).
             delivery_receipts: std::env::var("NEUTRINO_DELIVERY_RECEIPTS")
                 .is_ok_and(|v| matches!(v.as_str(), "1" | "true")),
+            media_max_bytes: std::env::var("NEUTRINO_MEDIA_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_MEDIA_MAX_BYTES),
             // `localpart` (and any future non-env field) defaults from `Default`,
             // so the value lives in exactly one place.
             ..Default::default()

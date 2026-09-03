@@ -542,3 +542,16 @@ CREATE TABLE sessions (
     user    TEXT NOT NULL,
     device  TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
+
+-- The content repository: what this server's users uploaded (origin = our
+-- server name) and what it fetched from peers (origin = theirs), verbatim.
+-- Uploads are capped small, so blobs live here rather than on disk.
+CREATE TABLE media (
+    origin        TEXT NOT NULL,
+    media_id      TEXT NOT NULL,
+    uploader      TEXT NOT NULL,
+    content_type  TEXT NOT NULL,
+    filename      TEXT,
+    bytes         BLOB NOT NULL,
+    PRIMARY KEY (origin, media_id)
+) STRICT, WITHOUT ROWID;

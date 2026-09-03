@@ -59,6 +59,10 @@ pub(crate) enum FederationClientError {
     /// surfaced rather than panicked on.
     #[error("could not build federation URL")]
     InvalidUrl,
+    /// The peer answered 2xx with a body that is not what the endpoint
+    /// promises — or more of it than this server will hold.
+    #[error("malformed federation response: {0}")]
+    Malformed(&'static str),
 }
 
 /// reqwest-backed client for outbound federation requests.
@@ -244,6 +248,59 @@ impl FederationClient {
             return Err(non_2xx_error(resp, dest, "POST /user/keys/query").await);
         }
         Ok(resp.json::<Value>().await?)
+    }
+
+    /// `GET http://{dest}/_matrix/federation/v1/media/download/{media_id}` —
+    /// fetch content a peer's user uploaded. The body is `multipart/mixed`
+    /// (metadata, then content); anything over `cap` bytes is refused
+    /// unread, so a peer cannot push more than this server will hold.
+    pub(crate) async fn media_download(
+        &self,
+        dest: &ServerName,
+        media_id: &str,
+        cap: usize,
+    ) -> Result<neutrino_store::StoredMedia, FederationClientError> {
+        let url = format!(
+            "http://{}/_matrix/federation/v1/media/download/{}",
+            self.url_authority(dest),
+            media_id
+        );
+        info!(target: "neutrino_http", %dest, %media_id, "outbound GET /_matrix/federation/v1/media/download");
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(non_2xx_error(resp, dest, "GET /media/download").await);
+        }
+        if resp
+            .content_length()
+            .is_some_and(|len| len > cap as u64 + 1024)
+        {
+            return Err(FederationClientError::Malformed("media over the cap"));
+        }
+        let boundary = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::media::multipart_boundary)
+            .ok_or(FederationClientError::Malformed("not multipart/mixed"))?;
+        let body = resp.bytes().await?;
+        if body.len() > cap + 1024 {
+            return Err(FederationClientError::Malformed("media over the cap"));
+        }
+        let (content_type, bytes) = crate::media::parse_multipart(&boundary, &body)
+            .ok_or(FederationClientError::Malformed("no content part"))?;
+        if bytes.len() > cap {
+            return Err(FederationClientError::Malformed("media over the cap"));
+        }
+        Ok(neutrino_store::StoredMedia {
+            content_type,
+            filename: None,
+            bytes,
+        })
     }
 
     /// `POST http://{dest}/_matrix/federation/v1/user/keys/claim` — take one

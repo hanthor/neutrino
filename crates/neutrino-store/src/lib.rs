@@ -954,6 +954,38 @@ pub trait SessionStore: Send + Sync {
     async fn put_session(&self, token: &str, user: &str, device: &str) -> Result<(), StorageError>;
 }
 
+/// One piece of content in the repository: what was uploaded, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMedia {
+    pub content_type: String,
+    pub filename: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+/// The content repository. Keyed by `(origin server, media id)`: what this
+/// server's users uploaded lives under its own name, and what it fetched
+/// from a peer is cached under the peer's, so an `mxc://` URI resolves the
+/// same way whichever node serves it.
+#[async_trait]
+pub trait MediaStore: Send + Sync {
+    /// Post: `(origin, media_id)` holds `media`; a repeat of the same key
+    ///       keeps the first (content under an id never changes).
+    async fn put_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+        uploader: &str,
+        media: &StoredMedia,
+    ) -> Result<(), StorageError>;
+
+    /// The content under `(origin, media_id)`, if held.
+    async fn get_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Option<StoredMedia>, StorageError>;
+}
+
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
     RoomStore
@@ -969,6 +1001,7 @@ pub trait StorageBackend:
     + E2eeStore
     + AccountDataStore
     + SessionStore
+    + MediaStore
 {
 }
 
@@ -986,6 +1019,7 @@ impl<T> StorageBackend for T where
         + E2eeStore
         + AccountDataStore
         + SessionStore
+        + MediaStore
 {
 }
 

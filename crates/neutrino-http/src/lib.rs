@@ -40,6 +40,7 @@ mod e2ee;
 mod ephemeral;
 mod federation;
 mod legacy_sync;
+mod media;
 mod membership;
 mod messages;
 mod redactions;
@@ -733,6 +734,21 @@ fn build_router(state: &AppState) -> Router {
             get(get_room_account_data).put(put_room_account_data),
         )
         .route("/_matrix/client/v3/account/whoami", get(whoami))
+        .route("/_matrix/media/v3/upload", post(media::upload))
+        .route("/_matrix/media/v3/config", get(media::config))
+        .route("/_matrix/client/v1/media/config", get(media::config))
+        .route(
+            "/_matrix/client/v1/media/download/{server_name}/{media_id}",
+            get(media::download),
+        )
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}",
+            get(media::download_legacy),
+        )
+        .route(
+            "/_matrix/federation/v1/media/download/{media_id}",
+            get(media::federation_download),
+        )
         .route("/_matrix/client/v3/room_keys/version", get(get_room_keys))
         .route("/_matrix/client/v3/createRoom", post(create_room))
         .route("/_matrix/client/v3/rooms/{room_id}/members", get(members))

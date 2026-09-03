@@ -146,3 +146,9 @@ TestKeyChangesLocal$
 # keyed per device. `TestRoomReadMarkers` stays out: `/read_markers` is not
 # wired.
 TestAddAccountData$
+
+# Media (2026-09-03): upload, authenticated and legacy download, config with
+# the cap, federation download. `TestRoomImageRoundtrip` stays out: it reads
+# the room back through a `/messages` filter (`contains_url`), which is not
+# wired. `TestAsyncUpload` stays out: no `/create` for async uploads.
+TestMediaConfig$
