@@ -36,6 +36,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info, info_span, warn};
 
 mod e2ee;
+mod ephemeral;
 mod federation;
 mod legacy_sync;
 mod membership;
@@ -47,6 +48,7 @@ mod sliding_sync;
 mod multi_user;
 
 use e2ee::E2eeState;
+use ephemeral::{EphemeralState, ReadReceipt};
 use federation::client::{FederationClient, ReqwestFetcher};
 use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use sliding_sync::{SyncError, SyncState};
@@ -82,6 +84,8 @@ struct App {
     /// The device-key directory and to-device inbox, shared with the sliding
     /// sync so a room key can wake a long-poll. See [`e2ee`].
     e2ee: Arc<E2eeState>,
+    /// Typing notices and read receipts, shared the same way. See [`ephemeral`].
+    ephemeral: Arc<EphemeralState>,
     /// Out-of-band peer discovery (BLE mesh): the host pushes the set of
     /// currently-visible peers here and the user-directory search handler reads
     /// it. Shared (`Arc`) so the host can hold a write handle while the router
@@ -277,9 +281,11 @@ impl AppState {
         let shutdown = CancellationToken::new();
         let e2ee = Arc::new(E2eeState::new());
         e2ee.attach_persistence(store.clone());
+        let ephemeral = Arc::new(EphemeralState::new());
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
         sync_state.delivery_receipts = config.delivery_receipts;
         sync_state.e2ee = e2ee.clone();
+        sync_state.ephemeral = ephemeral.clone();
         let sync_state = Arc::new(sync_state);
         let room_registry = Arc::new(RoomRegistry::new(
             store.clone(),
@@ -314,6 +320,7 @@ impl AppState {
             fed_client,
             sync_state,
             e2ee,
+            ephemeral,
             discovery,
             display_name_tx: None,
             policy,
@@ -679,6 +686,14 @@ fn build_router(state: &AppState) -> Router {
         .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
             put(redact_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
+            put(set_typing),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
+            post(send_receipt),
         )
         .route("/_matrix/client/v3/pushers/set", post(pushers_set))
         .route("/_matrix/client/v3/capabilities", get(get_capabilities))
@@ -2082,6 +2097,178 @@ async fn put_event(
     body: Json<Value>,
 ) -> axum::response::Response {
     send_via_actor(&state.0, sender, room_id, event_type, None, body.0).await
+}
+
+/// The servers, other than ours, that have a joined member in `room`: where
+/// an ephemeral notice about the room has to go.
+async fn member_servers(
+    store: &SqliteStore,
+    room: &ruma::RoomId,
+    our_name: &str,
+) -> Result<Vec<ruma::OwnedServerName>, StorageError> {
+    let members = store.joined_members(room).await?;
+    let mut servers: Vec<ruma::OwnedServerName> = members
+        .keys()
+        .map(|u| u.server_name().to_owned())
+        .filter(|s| s.as_str() != our_name)
+        .collect();
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
+}
+
+/// Queue one EDU for every server with a member in the room. Same durable
+/// outbox as to-device messages: a receipt that waits for the link to heal is
+/// still a receipt, and a stale typing notice expires on the receiving side.
+async fn fan_out_edu(
+    store: &SqliteStore,
+    room: &ruma::RoomId,
+    our_name: &str,
+    edu_id: &str,
+    edu: &Value,
+) -> Result<(), StorageError> {
+    let servers = member_servers(store, room, our_name).await?;
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let raw =
+        serde_json::value::to_raw_value(edu).expect("an EDU built from json! always serializes");
+    store.enqueue_edu(&servers, edu_id, &raw).await
+}
+
+/// `PUT /rooms/{room}/typing/{userId}` — start or stop a typing notice. Kept
+/// locally for this node's own clients and sent to every server in the room
+/// as an `m.typing` EDU.
+async fn set_typing(
+    state: State<AppState>,
+    AuthUser(sender): AuthUser,
+    axum::extract::Path((room_id, user_id)): axum::extract::Path<(String, String)>,
+    body: Json<Value>,
+) -> axum::response::Response {
+    let (our_name, store, ephemeral) = {
+        let app = lock_app(&state.0);
+        (
+            app.config.server_name.clone(),
+            app.store.clone(),
+            app.ephemeral.clone(),
+        )
+    };
+    let Ok(room) = OwnedRoomId::try_from(room_id.as_str()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "invalid room id",
+        );
+    };
+    if user_id != sender.as_str() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "cannot set another user's typing state",
+        );
+    }
+    let typing = body
+        .0
+        .get("typing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let timeout = body
+        .0
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_millis);
+    ephemeral.set_typing(&room, &sender, typing, timeout);
+
+    // The id makes a client retrying the same notice a no-op per destination;
+    // successive notices differ by time so each goes out.
+    let edu_id = format!(
+        "typing/{sender}/{room}/{typing}/{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    );
+    let edu = json!({
+        "edu_type": "m.typing",
+        "content": { "room_id": room, "user_id": sender, "typing": typing },
+    });
+    if let Err(e) = fan_out_edu(&store, &room, &our_name, &edu_id, &edu).await {
+        warn!(%room, error = %e, "queueing typing EDU");
+    }
+    Json(json!({})).into_response()
+}
+
+/// `POST /rooms/{room}/receipt/{receiptType}/{eventId}` — record where the
+/// user has read up to, and tell every server in the room. Only `m.read` is
+/// shared; a private receipt (`m.read.private`) stays on this node.
+async fn send_receipt(
+    state: State<AppState>,
+    AuthUser(sender): AuthUser,
+    axum::extract::Path((room_id, receipt_type, event_id)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> axum::response::Response {
+    let (our_name, store, ephemeral) = {
+        let app = lock_app(&state.0);
+        (
+            app.config.server_name.clone(),
+            app.store.clone(),
+            app.ephemeral.clone(),
+        )
+    };
+    let Ok(room) = OwnedRoomId::try_from(room_id.as_str()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "invalid room id",
+        );
+    };
+    let Ok(event) = ruma::OwnedEventId::try_from(event_id.as_str()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "invalid event id",
+        );
+    };
+    if !matches!(
+        receipt_type.as_str(),
+        "m.read" | "m.read.private" | "m.fully_read"
+    ) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "unknown receipt type",
+        );
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    if receipt_type == "m.read" {
+        ephemeral.set_receipt(
+            &room,
+            &sender,
+            ReadReceipt {
+                event_id: event.clone(),
+                ts,
+            },
+        );
+        let edu_id = format!("receipt/{sender}/{room}/{event}");
+        let edu = json!({
+            "edu_type": "m.receipt",
+            "content": {
+                room.as_str(): {
+                    "m.read": { sender.as_str(): { "event_ids": [event], "data": { "ts": ts } } }
+                }
+            },
+        });
+        if let Err(e) = fan_out_edu(&store, &room, &our_name, &edu_id, &edu).await {
+            warn!(%room, error = %e, "queueing receipt EDU");
+        }
+    }
+    Json(json!({})).into_response()
 }
 
 /// `PUT /rooms/{room}/redact/{eventId}/{txnId}` — delete a message, or take

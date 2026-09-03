@@ -6393,3 +6393,101 @@ async fn redacted_events_are_pruned_in_sliding_sync_too() {
     assert_eq!(message["content"], json!({}));
     assert!(message["unsigned"]["redacted_because"]["event_id"].is_string());
 }
+
+// === Typing and receipts over the wire ======================================
+
+#[tokio::test]
+async fn typing_and_receipt_endpoints_record_locally() {
+    let (store, _tmp) = fresh_store().await;
+    let state = crate::AppState::from_store(config(), store.clone());
+    let app = crate::build_router(&state);
+    let (_, created) = post_json(&app, "/_matrix/client/v3/createRoom", &json!({})).await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let room: OwnedRoomId = room_id.parse().unwrap();
+
+    let (status, _) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/typing/{}",
+            urlencoding(&room_id),
+            alice()
+        ),
+        &json!({ "typing": true, "timeout": 5000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ephemeral = crate::lock_app(&state).ephemeral.clone();
+    assert_eq!(ephemeral.typing_in(&room), vec![alice()]);
+
+    // Another user's typing state is not ours to set.
+    let (status, _) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/typing/{}",
+            urlencoding(&room_id),
+            peer_user()
+        ),
+        &json!({ "typing": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (_, sent) = cs_put(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/r1",
+            urlencoding(&room_id)
+        ),
+        &json!({ "msgtype": "m.text", "body": "seen" }),
+    )
+    .await;
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+    let (status, _) = post_json(
+        &app,
+        &format!(
+            "/_matrix/client/v3/rooms/{}/receipt/m.read/{}",
+            urlencoding(&room_id),
+            urlencoding(&event_id)
+        ),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let receipts = ephemeral.receipts_in(&room);
+    assert_eq!(receipts[&alice()].event_id.as_str(), event_id);
+}
+
+#[tokio::test]
+async fn inbound_typing_and_receipt_edus_are_applied() {
+    let (store, _tmp) = fresh_store().await;
+    let state = crate::AppState::from_store(config(), store.clone());
+    let app = crate::build_router(&state);
+    let (room_id, join_id) = create_joined_room_in(&store, &alice(), 1).await;
+
+    let status = send_edus(
+        &app,
+        "edu-ephemeral",
+        json!([
+            {
+                "edu_type": "m.typing",
+                "content": { "room_id": room_id, "user_id": peer_user(), "typing": true },
+            },
+            {
+                "edu_type": "m.receipt",
+                "content": {
+                    room_id.as_str(): {
+                        "m.read": { peer_user().as_str(): { "event_ids": [join_id], "data": { "ts": 77 } } }
+                    }
+                },
+            },
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ephemeral = crate::lock_app(&state).ephemeral.clone();
+    assert_eq!(ephemeral.typing_in(&room_id), vec![peer_user()]);
+    let receipt = &ephemeral.receipts_in(&room_id)[&peer_user()];
+    assert_eq!(receipt.event_id, join_id);
+    assert_eq!(receipt.ts, 77);
+}

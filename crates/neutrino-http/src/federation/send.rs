@@ -174,7 +174,7 @@ pub(crate) async fn handle(
     // so a resent transaction does not deliver the same room key twice; an
     // EDU-only transaction stages nothing, records itself as seen, and is
     // therefore deduped by exactly the same path as one carrying events.
-    deliver_to_device(&state, &our_name, &body.edus);
+    deliver_edus(&state, &our_name, &body.edus);
 
     // Parse + dedup by event_id, then durably stage each PDU. A PDU that fails
     // `from_wire` is unkeyable (no derivable id) and cannot appear in the
@@ -363,23 +363,35 @@ pub(crate) async fn handle(
     }))
 }
 
-/// Deposit the recipients of every `m.direct_to_device` EDU into the local
-/// to-device inboxes, ignoring EDU types this server does not implement.
+/// Apply the EDUs this server implements, ignoring the rest.
 ///
-/// This is the receiving half of mesh E2EE: the sending phone's homeserver PUT
-/// this transaction because the recipient is, from its point of view, a remote
-/// user. Messages addressed to users we do not own are dropped rather than
-/// relayed onward — we are not a router for someone else's devices, and
-/// forwarding would let any peer inject to-device traffic under our origin.
-fn deliver_to_device(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
+/// - `m.direct_to_device`: deposit each message into the local to-device
+///   inbox — the receiving half of mesh E2EE. Messages addressed to users we
+///   do not own are dropped rather than relayed onward: we are not a router
+///   for someone else's devices, and forwarding would let any peer inject
+///   to-device traffic under our origin.
+/// - `m.typing`: a peer's user started or stopped typing in a room.
+/// - `m.receipt`: a peer's user's read position moved.
+///
+/// Presence is not implemented and is dropped.
+fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
     use serde_json::Value;
 
     for raw in edus {
         let Ok(edu) = serde_json::from_str::<Value>(raw.get()) else {
             continue;
         };
-        if edu.get("edu_type").and_then(Value::as_str) != Some("m.direct_to_device") {
-            continue;
+        match edu.get("edu_type").and_then(Value::as_str) {
+            Some("m.direct_to_device") => {}
+            Some("m.typing") => {
+                apply_typing(state, edu.get("content"));
+                continue;
+            }
+            Some("m.receipt") => {
+                apply_receipts(state, edu.get("content"));
+                continue;
+            }
+            _ => continue,
         }
         let content = edu.get("content");
         let sender = content
@@ -417,6 +429,77 @@ fn deliver_to_device(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>
             for message in devices.values() {
                 e2ee.push_to_device(user, &event_type, &sender, message.clone());
             }
+        }
+    }
+}
+
+/// `m.typing` content: `{ room_id, user_id, typing }`. The notice is kept only
+/// for a user on the origin's side of the wire — a peer cannot make one of our
+/// users look like they are typing.
+fn apply_typing(state: &AppState, content: Option<&serde_json::Value>) {
+    use serde_json::Value;
+    let Some(content) = content else { return };
+    let (Some(room), Some(user)) = (
+        content.get("room_id").and_then(Value::as_str),
+        content.get("user_id").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let (Ok(room), Ok(user)) = (
+        ruma::OwnedRoomId::try_from(room),
+        ruma::OwnedUserId::try_from(user),
+    ) else {
+        return;
+    };
+    let typing = content
+        .get("typing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ephemeral = lock_app(state).ephemeral.clone();
+    ephemeral.set_typing(&room, &user, typing, None);
+}
+
+/// `m.receipt` content: `{ room_id: { "m.read": { user_id: { event_ids: [..],
+/// data: { ts } } } } }`. Only `m.read` is honoured; a user's position moves
+/// to the first listed event.
+fn apply_receipts(state: &AppState, content: Option<&serde_json::Value>) {
+    use serde_json::Value;
+    let Some(rooms) = content.and_then(Value::as_object) else {
+        return;
+    };
+    let ephemeral = lock_app(state).ephemeral.clone();
+    for (room, kinds) in rooms {
+        let Ok(room) = ruma::OwnedRoomId::try_from(room.as_str()) else {
+            continue;
+        };
+        let Some(readers) = kinds.get("m.read").and_then(Value::as_object) else {
+            continue;
+        };
+        for (user, receipt) in readers {
+            let Ok(user) = ruma::OwnedUserId::try_from(user.as_str()) else {
+                continue;
+            };
+            let Some(event) = receipt
+                .get("event_ids")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+                .and_then(|id| ruma::OwnedEventId::try_from(id).ok())
+            else {
+                continue;
+            };
+            let ts = receipt
+                .pointer("/data/ts")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            ephemeral.set_receipt(
+                &room,
+                &user,
+                crate::ephemeral::ReadReceipt {
+                    event_id: event,
+                    ts,
+                },
+            );
         }
     }
 }

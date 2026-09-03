@@ -3390,3 +3390,136 @@ async fn receipt_covers_every_user_of_the_acking_server_only() {
         "both of peer.test's users, and nobody from a server that never acked"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Typing and read receipts (ephemeral extensions).
+// -----------------------------------------------------------------------------
+
+/// A joined room for `user`, created through the store so the sync has
+/// something to list.
+async fn room_for(store: &Arc<SqliteStore>, user: &UserId) -> OwnedRoomId {
+    let create = neutrino_event::event_builder::EventBuilder::new(
+        user.to_owned(),
+        "m.room.create".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .state_key(String::new())
+    .content(serde_json::json!({ "room_version": ROOM_VERSION_ID }))
+    .build()
+    .unwrap();
+    let room_id = create.room_id.clone();
+    let join = neutrino_event::event_builder::EventBuilder::new(
+        user.to_owned(),
+        "m.room.member".to_owned(),
+        neutrino_event::base_version().clone(),
+    )
+    .room_id(room_id.clone())
+    .state_key(user.as_str().to_owned())
+    .content(serde_json::json!({ "membership": "join" }))
+    .prev_events(vec![create.event_id.clone()])
+    .prev_state_events(vec![create.event_id.clone()])
+    .build()
+    .unwrap();
+    store.create_room(&create, &[join]).await.unwrap();
+    room_id
+}
+
+fn ephemeral_request() -> Request {
+    let mut req = Request::new();
+    let mut list = request::List::default();
+    list.ranges = vec![(UInt::from(0u32), UInt::from(9u32))];
+    list.room_details.timeline_limit = UInt::from(5u32);
+    req.lists.insert("all".to_owned(), list);
+    req.extensions.typing.enabled = Some(true);
+    req.extensions.receipts.enabled = Some(true);
+    req
+}
+
+#[tokio::test]
+async fn typing_extension_lists_other_people_typing_and_not_me() {
+    let (store, _tmp) = fresh_store().await;
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let me = user_id!("@alice:example.org");
+    let peer = user_id!("@peer:remote.example.org");
+    let room_id = room_for(&store, me).await;
+
+    state.ephemeral.set_typing(&room_id, peer, true, None);
+    state.ephemeral.set_typing(&room_id, me, true, None);
+
+    let resp = handle(&state, me, ephemeral_request()).await.unwrap();
+    let typing = resp
+        .extensions
+        .typing
+        .rooms
+        .get(&room_id)
+        .expect("typing for the room");
+    let event: Value = serde_json::from_str(typing.json().get()).unwrap();
+    assert_eq!(
+        event["content"]["user_ids"],
+        serde_json::json!([peer.as_str()])
+    );
+
+    // Stopping empties it; an absent room carries no entry rather than an
+    // empty list.
+    state.ephemeral.set_typing(&room_id, peer, false, None);
+    let resp = handle(&state, me, ephemeral_request()).await.unwrap();
+    assert!(resp.extensions.typing.rooms.is_empty());
+}
+
+#[tokio::test]
+async fn a_typing_notice_wakes_a_long_poll() {
+    let (store, _tmp) = fresh_store().await;
+    let state = Arc::new(SyncState::new(store.clone(), no_shutdown()));
+    let me = user_id!("@alice:example.org");
+    let peer = user_id!("@peer:remote.example.org");
+    let room_id = room_for(&store, me).await;
+
+    let initial = handle(&state, me, ephemeral_request()).await.unwrap();
+    let mut req = ephemeral_request();
+    req.pos = Some(initial.pos.clone());
+    req.timeout = Some(std::time::Duration::from_secs(10));
+    let poll = {
+        let state = state.clone();
+        tokio::spawn(async move { handle(&state, me, req).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    state.ephemeral.set_typing(&room_id, peer, true, None);
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(3), poll)
+        .await
+        .expect("long-poll woke on the typing notice")
+        .unwrap()
+        .unwrap();
+    assert!(resp.extensions.typing.rooms.contains_key(&room_id));
+}
+
+#[tokio::test]
+async fn receipts_extension_carries_real_read_receipts() {
+    let (store, _tmp) = fresh_store().await;
+    let state = SyncState::new(store.clone(), no_shutdown());
+    let me = user_id!("@alice:example.org");
+    let peer = user_id!("@peer:remote.example.org");
+    let room_id = room_for(&store, me).await;
+    let event_id: ruma::OwnedEventId = "$read:remote.example.org".try_into().unwrap();
+    state.ephemeral.set_receipt(
+        &room_id,
+        peer,
+        crate::ephemeral::ReadReceipt {
+            event_id: event_id.clone(),
+            ts: 1234,
+        },
+    );
+
+    let resp = handle(&state, me, ephemeral_request()).await.unwrap();
+    let receipt = resp
+        .extensions
+        .receipts
+        .rooms
+        .get(&room_id)
+        .expect("receipt for the room");
+    let event: Value = serde_json::from_str(receipt.json().get()).unwrap();
+    assert_eq!(
+        event["content"][event_id.as_str()]["m.read"][peer.as_str()]["ts"],
+        serde_json::json!(1234)
+    );
+}

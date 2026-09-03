@@ -14,6 +14,7 @@
 // lands.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use neutrino_event::event_view::StateEventConversionError;
 
 use crate::e2ee::E2eeState;
+use crate::ephemeral::EphemeralState;
 use neutrino_store::{StorageBackend, StorageError};
 use ruma::OneTimeKeyAlgorithm;
 use ruma::UInt;
@@ -108,6 +110,8 @@ pub struct SyncState<S> {
     /// handlers that fill it (`/keys/*`, `/sendToDevice`, inbound EDUs); the
     /// long-poll watches it so a room key wakes the recipient.
     pub e2ee: Arc<E2eeState>,
+    /// Typing notices and read receipts, shared and watched the same way.
+    pub ephemeral: Arc<EphemeralState>,
     /// Whether to synthesise delivery receipts from federation delivery marks
     /// (`Config::delivery_receipts`, off by default — see [`receipts`]). Set by
     /// the composition root; a client must *also* opt into the receipts
@@ -125,6 +129,7 @@ impl<S> SyncState<S> {
             store,
             registry: ConnRegistry::new(),
             e2ee: Arc::new(E2eeState::new()),
+            ephemeral: Arc::new(EphemeralState::new()),
             delivery_receipts: false,
             shutdown,
         }
@@ -224,6 +229,12 @@ pub async fn handle<S: StorageBackend>(
     // And the to-device inbox, which is neither: a room key arriving is new
     // data for exactly this client and must not wait for a room event.
     let mut e2ee_rx = state.e2ee.subscribe();
+    // Typing and receipts: remember where they stood when this request began,
+    // so a change during the wait is returned by the build that follows it.
+    let mut ephemeral_rx = state.ephemeral.subscribe();
+    let ephemeral_at_start = state.ephemeral.version();
+    let wants_ephemeral = req.extensions.typing.enabled == Some(true)
+        || req.extensions.receipts.enabled == Some(true);
 
     // Short wait while the prior holder (if any) observes the cancel above
     // and unwinds.
@@ -272,7 +283,11 @@ pub async fn handle<S: StorageBackend>(
 
     let mut final_resp = loop {
         let resp = build::build_response(state, user_id, &req, &mut conn_guard).await?;
-        if !wait_for_data || has_data(&resp) || has_to_device(state, user_id, &extensions_req) {
+        if !wait_for_data
+            || has_data(&resp)
+            || has_to_device(state, user_id, &extensions_req)
+            || (wants_ephemeral && state.ephemeral.version() != ephemeral_at_start)
+        {
             break resp;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -304,6 +319,7 @@ pub async fn handle<S: StorageBackend>(
                 _ = rx.changed() => {}
                 _ = delivery_rx.changed(), if state.delivery_receipts => {}
                 _ = e2ee_rx.changed(), if extensions_req.to_device.enabled == Some(true) => {}
+                _ = ephemeral_rx.changed(), if wants_ephemeral => {}
             }
         };
         tokio::select! {
@@ -317,7 +333,7 @@ pub async fn handle<S: StorageBackend>(
         }
     };
 
-    populate_extensions(state, user_id, &extensions_req, &mut final_resp);
+    populate_extensions(state, user_id, &extensions_req, &mut final_resp).await?;
 
     // `build_response` chose `conn.pos + 1` as the response's pos_token but
     // didn't mutate `conn.pos` — commit the advance here, once per request,
@@ -469,12 +485,12 @@ fn has_to_device<S>(
 /// [`E2eeState::one_time_key_counts_for_user`] for the multi-device caveat)
 /// and, honestly, no unused fallback key types: fallback keys are not stored.
 /// `device_lists` stays empty — device-list updates are not implemented.
-fn populate_extensions<S>(
+async fn populate_extensions<S: StorageBackend>(
     state: &SyncState<S>,
     user_id: &UserId,
     req_ext: &v5::request::Extensions,
     resp: &mut v5::Response,
-) {
+) -> Result<(), SyncError> {
     if req_ext.e2ee.enabled == Some(true) {
         let mut e2ee = v5::response::E2EE::default();
         for (algorithm, count) in state.e2ee.one_time_key_counts_for_user(user_id.as_str()) {
@@ -486,6 +502,69 @@ fn populate_extensions<S>(
         }
         e2ee.device_unused_fallback_key_types = Some(Vec::new());
         resp.extensions.e2ee = e2ee;
+    }
+    if req_ext.typing.enabled == Some(true) {
+        // Every room with a live notice that this user is joined to — not
+        // only the rooms the response happens to mention, since a delta with
+        // no new events is exactly when a typing notice is the news.
+        let mut typing = v5::response::Typing::default();
+        for room_id in state.ephemeral.rooms_with_typing() {
+            if !state
+                .store
+                .joined_members(&room_id)
+                .await?
+                .contains_key(user_id)
+            {
+                continue;
+            }
+            let users: Vec<_> = state
+                .ephemeral
+                .typing_in(&room_id)
+                .into_iter()
+                .filter(|u| u != user_id)
+                .collect();
+            if users.is_empty() {
+                continue;
+            }
+            // ruma's `SyncTypingEvent` is `#[non_exhaustive]`; build the wire
+            // shape directly, which is one object with two keys.
+            let event = serde_json::json!({ "type": "m.typing", "content": { "user_ids": users } });
+            if let Ok(raw) = serde_json::value::to_raw_value(&event) {
+                typing.rooms.insert(room_id.clone(), Raw::from_json(raw));
+            }
+        }
+        resp.extensions.typing = typing;
+    }
+    if req_ext.receipts.enabled == Some(true) {
+        // Real read receipts, merged over whatever the delivery synthesis put
+        // there: a user's own m.read says more than their server's ack.
+        for room_id in state.ephemeral.rooms_with_receipts() {
+            if !state
+                .store
+                .joined_members(&room_id)
+                .await?
+                .contains_key(user_id)
+            {
+                continue;
+            }
+            let held = state.ephemeral.receipts_in(&room_id);
+            if held.is_empty() {
+                continue;
+            }
+            let mut content = ruma::events::receipt::ReceiptEventContent(BTreeMap::new());
+            for (user, receipt) in held {
+                let ts = ruma::MilliSecondsSinceUnixEpoch(UInt::new_saturating(receipt.ts));
+                content
+                    .entry(receipt.event_id)
+                    .or_default()
+                    .entry(ruma::events::receipt::ReceiptType::Read)
+                    .or_default()
+                    .insert(user, ruma::events::receipt::Receipt::new(ts));
+            }
+            if let Ok(raw) = Raw::new(&ruma::events::receipt::SyncReceiptEvent::new(content)) {
+                resp.extensions.receipts.rooms.insert(room_id.clone(), raw);
+            }
+        }
     }
     if req_ext.to_device.enabled == Some(true) {
         // ruma v5's response types are `#[non_exhaustive]`; build via Default
@@ -504,4 +583,5 @@ fn populate_extensions<S>(
             .collect();
         resp.extensions.to_device = Some(to_device);
     }
+    Ok(())
 }
