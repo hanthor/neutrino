@@ -3,6 +3,7 @@
 
 mod dag;
 mod deliveries;
+mod e2ee;
 mod events;
 mod identity;
 mod inbox;

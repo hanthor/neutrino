@@ -1,6 +1,6 @@
 //! The server's share of end-to-end encryption: a device-key directory and a
 //! to-device inbox, shared between the HTTP handlers and the sliding-sync
-//! long-poll.
+//! long-poll, written through to the store and reloaded at start.
 //!
 //! Matrix keeps the cryptography in the client. What a homeserver holds is
 //! public key material and ciphertext addressed to devices, and what it has
@@ -9,16 +9,62 @@
 //! until then. So this state carries its own watch, advanced on every inbox
 //! write, and the sync handlers select on it alongside the event stream.
 //!
+//! Memory is authoritative at runtime; every mutation is journaled to a task
+//! that writes it to the [`E2eeStore`] in order. On a phone the app is killed
+//! routinely, and a restart that forgot every device key and every
+//! undelivered room key would silently break every peer's Olm session.
+//!
 //! Held once per server behind an `Arc`, locked independently of `App`: the
 //! sync path must reach it without taking the whole application lock, and
 //! nothing here ever needs `App`. Lock order, where both are taken, is `App`
 //! then this — never the reverse.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use neutrino_store::{E2eeSnapshot, E2eeStore};
+use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tracing::error;
+
+/// One write-through, applied to the store in the order it was journaled.
+/// Memory has already changed by the time an `Op` is sent; the store is
+/// catching up, never consulted.
+#[derive(Debug)]
+pub(crate) enum Op {
+    PutDevice {
+        user: String,
+        device: String,
+        keys: Box<RawJsonValue>,
+    },
+    PutOneTimeKeys {
+        user: String,
+        device: String,
+        keys: Vec<(String, Box<RawJsonValue>)>,
+    },
+    RemoveOneTimeKey {
+        user: String,
+        device: String,
+        key_id: String,
+    },
+    PutCrossSigning {
+        name: String,
+        value: Box<RawJsonValue>,
+    },
+    PushToDevice {
+        id: i64,
+        user: String,
+        event: Box<RawJsonValue>,
+    },
+    RemoveToDevice {
+        ids: Vec<i64>,
+    },
+}
+
+fn raw(value: &Value) -> Box<RawJsonValue> {
+    serde_json::value::to_raw_value(value).expect("a serde_json::Value always serializes")
+}
 
 /// The end-to-end encryption key directory.
 ///
@@ -34,16 +80,67 @@ pub(crate) struct KeyStore {
     pub(crate) one_time_keys: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
     /// Cross-signing keys, merged as uploaded and echoed back on query.
     pub(crate) cross_signing: serde_json::Map<String, Value>,
+    /// Where every mutation is written through to, when persistence is
+    /// attached. `None` in unit tests that want memory only.
+    journal: Option<mpsc::UnboundedSender<Op>>,
 }
 
 impl KeyStore {
+    fn journal(&self, op: Op) {
+        if let Some(journal) = &self.journal {
+            // A closed journal means the persistence task is gone, which only
+            // happens at shutdown; memory stays correct either way.
+            let _ = journal.send(op);
+        }
+    }
+
     /// Store a device's keys under the id the device actually claims, not a
     /// fixed one: two devices of the same user must not overwrite each other.
     pub(crate) fn put_device(&mut self, user: &str, device: &str, keys: Value) {
+        self.journal(Op::PutDevice {
+            user: user.to_owned(),
+            device: device.to_owned(),
+            keys: raw(&keys),
+        });
         self.devices
             .entry(user.to_owned())
             .or_default()
             .insert(device.to_owned(), keys);
+    }
+
+    /// Store a cross-signing section as uploaded; echoed back on query.
+    pub(crate) fn put_cross_signing(&mut self, name: &str, value: Value) {
+        self.journal(Op::PutCrossSigning {
+            name: name.to_owned(),
+            value: raw(&value),
+        });
+        self.cross_signing.insert(name.to_owned(), value);
+    }
+
+    /// Merge a `/keys/signatures/upload` block into the stored device it
+    /// signs. An absent device is skipped rather than created, since a
+    /// signature over nothing means nothing.
+    pub(crate) fn merge_device_signatures(
+        &mut self,
+        user: &str,
+        device: &str,
+        signatures: serde_json::Map<String, Value>,
+    ) {
+        let Some(stored) = self.devices.get_mut(user).and_then(|d| d.get_mut(device)) else {
+            return;
+        };
+        if let Some(target) = stored
+            .pointer_mut(&format!("/signatures/{user}"))
+            .and_then(Value::as_object_mut)
+        {
+            target.extend(signatures);
+        }
+        let keys = raw(stored);
+        self.journal(Op::PutDevice {
+            user: user.to_owned(),
+            device: device.to_owned(),
+            keys,
+        });
     }
 
     /// Merge uploaded one-time keys, keeping any already held.
@@ -59,9 +156,18 @@ impl KeyStore {
             .or_default()
             .entry(device.to_owned())
             .or_default();
+        let mut fresh = Vec::new();
         for (key_id, key) in keys {
+            if !slot.contains_key(key_id) {
+                fresh.push((key_id.clone(), raw(key)));
+            }
             slot.insert(key_id.clone(), key.clone());
         }
+        self.journal(Op::PutOneTimeKeys {
+            user: user.to_owned(),
+            device: device.to_owned(),
+            keys: fresh,
+        });
     }
 
     /// Counts by algorithm, which is what `/keys/upload` answers with. The
@@ -158,6 +264,11 @@ impl KeyStore {
             .find(|id| id.split_once(':').is_some_and(|(a, _)| a == algorithm))
             .cloned()?;
         let key = keys.remove(&key_id)?;
+        self.journal(Op::RemoveOneTimeKey {
+            user: user.to_owned(),
+            device: device.to_owned(),
+            key_id: key_id.clone(),
+        });
         Some((key_id, key))
     }
 }
@@ -168,14 +279,18 @@ impl KeyStore {
 pub(crate) struct Inner {
     /// Device keys, one-time keys and cross-signing blobs, per user and device.
     pub(crate) keys: KeyStore,
-    /// Undelivered to-device messages, per recipient user. Drained by sync.
+    /// Undelivered to-device messages, per recipient user, each under the id
+    /// its store row carries. Drained by sync.
     ///
     /// Keyed by user rather than by device because login issues one device id
     /// for everyone, so the server cannot yet tell two of a user's devices
     /// apart. On a mesh node — one user, one phone — the two are the same
     /// thing; on a multi-device account they are not, and this needs
     /// revisiting when login stops handing out a fixed device id.
-    pub(crate) to_device: BTreeMap<String, Vec<Value>>,
+    pub(crate) to_device: BTreeMap<String, Vec<(i64, Value)>>,
+    /// Next inbox id. Process-lifetime, seeded past the loaded snapshot's
+    /// maximum so memory and disk name the same rows.
+    next_inbox_id: i64,
 }
 
 pub(crate) struct E2eeState {
@@ -208,6 +323,92 @@ impl E2eeState {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Rebuild memory from what the store holds. Called once before serving;
+    /// rows loaded here are not journaled again.
+    pub(crate) fn load(&self, snapshot: E2eeSnapshot) {
+        let parse = |r: &RawJsonValue| serde_json::from_str::<Value>(r.get()).ok();
+        let mut inner = self.lock();
+        for (user, device, keys) in &snapshot.devices {
+            if let Some(keys) = parse(keys) {
+                inner
+                    .keys
+                    .devices
+                    .entry(user.clone())
+                    .or_default()
+                    .insert(device.clone(), keys);
+            }
+        }
+        for (user, device, key_id, key) in &snapshot.one_time_keys {
+            if let Some(key) = parse(key) {
+                inner
+                    .keys
+                    .one_time_keys
+                    .entry(user.clone())
+                    .or_default()
+                    .entry(device.clone())
+                    .or_default()
+                    .insert(key_id.clone(), key);
+            }
+        }
+        for (name, value) in &snapshot.cross_signing {
+            if let Some(value) = parse(value) {
+                inner.keys.cross_signing.insert(name.clone(), value);
+            }
+        }
+        let mut max_id = inner.next_inbox_id - 1;
+        for (id, user, event) in &snapshot.to_device {
+            if let Some(event) = parse(event) {
+                inner
+                    .to_device
+                    .entry(user.clone())
+                    .or_default()
+                    .push((*id, event));
+                max_id = max_id.max(*id);
+            }
+        }
+        inner.next_inbox_id = max_id + 1;
+        drop(inner);
+        if !snapshot.to_device.is_empty() {
+            self.changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// Write every later mutation through to `store`, in order, on a task
+    /// that lives as long as this state does. Memory stays authoritative; a
+    /// write that fails is logged, and the next restart simply loads less
+    /// than it might have.
+    pub(crate) fn attach_persistence<S: E2eeStore + 'static>(&self, store: Arc<S>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Op>();
+        self.lock().keys.journal = Some(tx);
+        tokio::spawn(async move {
+            while let Some(op) = rx.recv().await {
+                let result = match &op {
+                    Op::PutDevice { user, device, keys } => {
+                        store.put_device_keys(user, device, keys).await
+                    }
+                    Op::PutOneTimeKeys { user, device, keys } => {
+                        store.put_one_time_keys(user, device, keys).await
+                    }
+                    Op::RemoveOneTimeKey {
+                        user,
+                        device,
+                        key_id,
+                    } => store.remove_one_time_key(user, device, key_id).await,
+                    Op::PutCrossSigning { name, value } => {
+                        store.put_cross_signing(name, value).await
+                    }
+                    Op::PushToDevice { id, user, event } => {
+                        store.push_to_device(*id, user, event).await
+                    }
+                    Op::RemoveToDevice { ids } => store.remove_to_device(ids).await,
+                };
+                if let Err(e) = result {
+                    error!(error = %e, ?op, "persisting E2EE state");
+                }
+            }
+        });
+    }
+
     /// Queue one to-device event for `user` and wake anyone syncing as them.
     pub(crate) fn push_to_device(
         &self,
@@ -216,15 +417,25 @@ impl E2eeState {
         sender: &str,
         content: Value,
     ) {
-        self.lock()
+        let event = json!({
+            "type": event_type,
+            "sender": sender,
+            "content": content,
+        });
+        let mut inner = self.lock();
+        let id = inner.next_inbox_id;
+        inner.next_inbox_id += 1;
+        inner.keys.journal(Op::PushToDevice {
+            id,
+            user: user.to_owned(),
+            event: raw(&event),
+        });
+        inner
             .to_device
             .entry(user.to_owned())
             .or_default()
-            .push(json!({
-                "type": event_type,
-                "sender": sender,
-                "content": content,
-            }));
+            .push((id, event));
+        drop(inner);
         self.changed.send_modify(|n| *n += 1);
     }
 
@@ -232,7 +443,14 @@ impl E2eeState {
     /// expects a to-device message to be delivered once; the client
     /// acknowledges by syncing again with the returned token.
     pub(crate) fn drain_to_device(&self, user: &str) -> Vec<Value> {
-        self.lock().to_device.remove(user).unwrap_or_default()
+        let mut inner = self.lock();
+        let drained = inner.to_device.remove(user).unwrap_or_default();
+        if drained.is_empty() {
+            return Vec::new();
+        }
+        let ids: Vec<i64> = drained.iter().map(|(id, _)| *id).collect();
+        inner.keys.journal(Op::RemoveToDevice { ids });
+        drained.into_iter().map(|(_, event)| event).collect()
     }
 
     /// How many to-device events wait for `user` — what a long-poll checks to

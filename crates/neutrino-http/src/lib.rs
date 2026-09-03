@@ -18,7 +18,9 @@ use neutrino_event::{Event, EventPolicy, FormatError};
 use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
-use neutrino_store::{FederationOutbox, IdentityStore, RoomStore, StateStore, StorageError};
+use neutrino_store::{
+    E2eeStore, FederationOutbox, IdentityStore, RoomStore, StateStore, StorageError,
+};
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
 use ruma::events::AnyTimelineEvent;
@@ -273,6 +275,7 @@ impl AppState {
     ) -> Self {
         let shutdown = CancellationToken::new();
         let e2ee = Arc::new(E2eeState::new());
+        e2ee.attach_persistence(store.clone());
         let mut sync_state = SyncState::new(store.clone(), shutdown.clone());
         sync_state.delivery_receipts = config.delivery_receipts;
         sync_state.e2ee = e2ee.clone();
@@ -327,6 +330,19 @@ impl AppState {
     /// federation sender pool to the same `SqliteStore` the router serves from.
     fn store(&self) -> Arc<SqliteStore> {
         lock_app(self).store.clone()
+    }
+
+    /// Rebuild the E2EE directory and inbox from the store. Must run before
+    /// the router serves: a request answered from an empty directory would
+    /// tell a peer a device does not exist.
+    pub(crate) async fn load_e2ee(&self) -> Result<(), StorageError> {
+        let (store, e2ee) = {
+            let app = lock_app(self);
+            (app.store.clone(), app.e2ee.clone())
+        };
+        let snapshot = store.load_e2ee().await?;
+        e2ee.load(snapshot);
+        Ok(())
     }
 
     /// This homeserver's name, sent as the `origin` on outbound transactions.
@@ -445,6 +461,7 @@ pub async fn serve(
     AppState::validate_config(&config)?;
     let state = AppState::from_store_with_discovery(config, store, discovery, policy);
     lock_app(&state).display_name_tx = display_name_tx;
+    state.load_e2ee().await?;
     // Start draining the federation outbox before serving. Outbox rows survive
     // restarts, so this is also the "retry on restart" path — startup
     // enumeration resumes delivery of anything left undelivered.
@@ -519,6 +536,7 @@ fn handle(command: Command, state: &AppState) -> ControlFlow<()> {
 
 pub async fn router(config: Config) -> Result<Router, StartupError> {
     let state = AppState::new(config).await?;
+    state.load_e2ee().await?;
     Ok(build_router(&state))
 }
 
@@ -1549,7 +1567,7 @@ async fn device_signing_upload(state: State<AppState>, body: Json<Value>) -> Jso
     if let Some(body_obj) = body.as_object() {
         let mut inner = e2ee.lock();
         for (key, value) in body_obj {
-            inner.keys.cross_signing.insert(key.clone(), value.clone());
+            inner.keys.put_cross_signing(key, value.clone());
         }
     }
 
@@ -1561,9 +1579,8 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
     let e2ee = lock_app(&state.0).e2ee.clone();
     let mut inner = e2ee.lock();
 
-    // The body is `{user: {device: {signatures...}}}`. Merge each signature
-    // block into the stored device it signs; an absent device is skipped
-    // rather than created, since a signature over nothing means nothing.
+    // The body is `{user: {device: {signatures...}}}`; each block is merged
+    // into the stored device it signs.
     let uploaded = body.0.as_object().cloned().unwrap_or_default();
     for (user, devices) in uploaded {
         let Some(devices) = devices.as_object() else {
@@ -1577,20 +1594,7 @@ async fn signatures_upload(state: State<AppState>, body: Json<Value>) -> Json<Va
             else {
                 continue;
             };
-            let Some(stored) = inner
-                .keys
-                .devices
-                .get_mut(&user)
-                .and_then(|d| d.get_mut(device))
-            else {
-                continue;
-            };
-            if let Some(target) = stored
-                .pointer_mut(&format!("/signatures/{}", user))
-                .and_then(Value::as_object_mut)
-            {
-                target.extend(sigs);
-            }
+            inner.keys.merge_device_signatures(&user, device, sigs);
         }
     }
 

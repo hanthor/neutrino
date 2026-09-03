@@ -815,6 +815,87 @@ pub trait IdentityStore: Send + Sync {
     async fn get_or_create_server_name(&self, current: &str) -> Result<String, StorageError>;
 }
 
+/// Everything the server holds for end-to-end encryption, as loaded at
+/// startup: the device-key directory, the one-time keys not yet handed out,
+/// cross-signing blobs, and to-device messages not yet delivered. Rows are
+/// wire-verbatim JSON; the store interprets none of it.
+#[derive(Debug, Default)]
+pub struct E2eeSnapshot {
+    /// `(user, device, device_keys object)`.
+    pub devices: Vec<(String, String, Box<RawJsonValue>)>,
+    /// `(user, device, key id, key object)`.
+    pub one_time_keys: Vec<(String, String, String, Box<RawJsonValue>)>,
+    /// `(name, value)` — the sections of a `/keys/device_signing/upload` body.
+    pub cross_signing: Vec<(String, Box<RawJsonValue>)>,
+    /// `(inbox id, recipient user, event)`, in delivery order.
+    pub to_device: Vec<(i64, String, Box<RawJsonValue>)>,
+}
+
+/// Durable home for the server's share of E2EE. On a phone the app is killed
+/// routinely, and a restart that forgets every device key and every
+/// undelivered room key silently breaks every peer's Olm session — so the
+/// in-memory directory is a cache over these rows, written through and
+/// reloaded at start.
+///
+/// Every write is idempotent on its key so a journal replay after a fault
+/// converges; none returns what it wrote, since memory is authoritative.
+#[async_trait]
+pub trait E2eeStore: Send + Sync {
+    /// Pre:  none.
+    /// Post: everything held, in insertion order per table.
+    async fn load_e2ee(&self) -> Result<E2eeSnapshot, StorageError>;
+
+    /// Pre:  `keys` is a device_keys object.
+    /// Post: the `(user, device)` row holds `keys`, replacing any previous.
+    async fn put_device_keys(
+        &self,
+        user: &str,
+        device: &str,
+        keys: &RawJsonValue,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: one row per `(user, device, key id)`; an existing id keeps its
+    ///       earlier value (a one-time key is never silently replaced).
+    async fn put_one_time_keys(
+        &self,
+        user: &str,
+        device: &str,
+        keys: &[(String, Box<RawJsonValue>)],
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: the row is gone; idempotent. Called when the key is claimed.
+    async fn remove_one_time_key(
+        &self,
+        user: &str,
+        device: &str,
+        key_id: &str,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: the named cross-signing section holds `value`, replacing any
+    ///       previous.
+    async fn put_cross_signing(&self, name: &str, value: &RawJsonValue)
+    -> Result<(), StorageError>;
+
+    /// Pre:  `id` is unique per process lifetime and increasing (the caller
+    ///       seeds its counter from the loaded snapshot's maximum).
+    /// Post: the event waits for `user` under `id`; a repeat of the same id is
+    ///       ignored.
+    async fn push_to_device(
+        &self,
+        id: i64,
+        user: &str,
+        event: &RawJsonValue,
+    ) -> Result<(), StorageError>;
+
+    /// Pre:  none.
+    /// Post: the named rows are gone; idempotent. Called once the events have
+    ///       been handed to a sync response.
+    async fn remove_to_device(&self, ids: &[i64]) -> Result<(), StorageError>;
+}
+
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
     RoomStore
@@ -827,6 +908,7 @@ pub trait StorageBackend:
     + StagingStore
     + InviteStore
     + IdentityStore
+    + E2eeStore
 {
 }
 
@@ -841,6 +923,7 @@ impl<T> StorageBackend for T where
         + StagingStore
         + InviteStore
         + IdentityStore
+        + E2eeStore
 {
 }
 

@@ -6084,3 +6084,107 @@ async fn unimplemented_edu_types_are_ignored() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sync_to_device(&app).await.len(), 1);
 }
+
+// === E2EE state survives a restart ==========================================
+
+/// Poll the store until `pred` holds over the loaded E2EE snapshot, or panic
+/// after ~5s. Writes are journaled asynchronously, so a test that reopens the
+/// store right after an HTTP call has to wait for the journal to catch up.
+async fn wait_for_persisted(
+    store: &SqliteStore,
+    pred: impl Fn(&neutrino_store::E2eeSnapshot) -> bool,
+) {
+    use neutrino_store::E2eeStore;
+    for _ in 0..250 {
+        let snapshot = store.load_e2ee().await.unwrap();
+        if pred(&snapshot) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("E2EE state was not persisted within timeout");
+}
+
+#[tokio::test]
+async fn device_keys_one_time_keys_and_inbox_survive_a_restart() {
+    // A phone kills the app routinely. Everything a peer's Olm session
+    // depends on — our device keys, the one-time keys not yet claimed, and
+    // any room key still waiting in the inbox — must come back after a
+    // restart, and a key claimed before the restart must stay claimed.
+    let (store, _tmp) = fresh_store().await;
+    let first = crate::AppState::from_store(config(), store.clone());
+    let app = crate::build_router(&first);
+
+    upload_device(
+        &app,
+        alice().as_str(),
+        "PHONE",
+        json!({ "signed_curve25519:k1": { "key": "one" }, "signed_curve25519:k2": { "key": "two" } }),
+    )
+    .await;
+    let (status, body) = post_json(
+        &app,
+        FED_KEYS_CLAIM,
+        &json!({ "one_time_keys": { alice().as_str(): { "PHONE": "signed_curve25519" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["one_time_keys"][alice().as_str()]["PHONE"]["signed_curve25519:k1"].is_object());
+    assert_eq!(
+        send_edus(
+            &app,
+            "restart-edu",
+            json!([{
+                "edu_type": "m.direct_to_device",
+                "content": {
+                    "sender": peer_user().as_str(),
+                    "type": "m.room_key",
+                    "messages": { alice().as_str(): { "*": { "session_id": "S1" } } },
+                },
+            }]),
+        )
+        .await,
+        StatusCode::OK
+    );
+    wait_for_persisted(&store, |s| {
+        s.devices.len() == 1 && s.one_time_keys.len() == 1 && s.to_device.len() == 1
+    })
+    .await;
+
+    // "Restart": a fresh application state over the same store, loaded the
+    // way `serve` loads it.
+    let second = crate::AppState::from_store(config(), store.clone());
+    second.load_e2ee().await.unwrap();
+    let app = crate::build_router(&second);
+
+    let (_, body) = post_json(
+        &app,
+        FED_KEYS_QUERY,
+        &json!({ "device_keys": { alice().as_str(): [] } }),
+    )
+    .await;
+    assert_eq!(
+        body["device_keys"][alice().as_str()]["PHONE"]["device_id"],
+        "PHONE"
+    );
+
+    // Exactly the unclaimed key is left, and claiming it works once.
+    let ask = json!({ "one_time_keys": { alice().as_str(): { "PHONE": "signed_curve25519" } } });
+    let (_, body) = post_json(&app, FED_KEYS_CLAIM, &ask).await;
+    assert!(body["one_time_keys"][alice().as_str()]["PHONE"]["signed_curve25519:k2"].is_object());
+    let (_, body) = post_json(&app, FED_KEYS_CLAIM, &ask).await;
+    assert_eq!(body["one_time_keys"], json!({}));
+
+    // The room key that was waiting is delivered, once.
+    let events = sync_to_device(&app).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["content"]["session_id"], "S1");
+    assert!(sync_to_device(&app).await.is_empty());
+
+    // And the drain reached the store: a third start finds the inbox empty
+    // and the claimed key gone.
+    wait_for_persisted(&store, |s| {
+        s.to_device.is_empty() && s.one_time_keys.is_empty()
+    })
+    .await;
+}

@@ -469,3 +469,41 @@ CREATE TABLE server_identity (
     value ANY  NOT NULL,
     CHECK (key <> 'secret' OR (typeof(value) = 'blob' AND length(value) = 32))
 ) STRICT;
+
+-- ----------------------------------------------------------------------------
+-- E2EE — E2eeStore
+-- The server's share of end-to-end encryption: public key material and
+-- ciphertext addressed to devices, all wire-verbatim JSON text. Memory is the
+-- authoritative copy at runtime (see neutrino-http's E2eeState); these rows
+-- are written through and reloaded at start so a restart forgets nothing.
+-- One-time keys are rows so a claim is a DELETE, never a rewrite of a blob.
+-- The inbox id is caller-assigned (a process-lifetime counter seeded from
+-- MAX(inbox_id)) so memory and disk agree on which rows a drain removes.
+-- ----------------------------------------------------------------------------
+CREATE TABLE device_keys (
+    user    TEXT NOT NULL,
+    device  TEXT NOT NULL,
+    keys    TEXT NOT NULL,
+    PRIMARY KEY (user, device)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE one_time_keys (
+    user    TEXT NOT NULL,
+    device  TEXT NOT NULL,
+    key_id  TEXT NOT NULL,
+    key     TEXT NOT NULL,
+    PRIMARY KEY (user, device, key_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE cross_signing_keys (
+    name   TEXT NOT NULL PRIMARY KEY,
+    value  TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE to_device_inbox (
+    inbox_id  INTEGER NOT NULL PRIMARY KEY,
+    user      TEXT NOT NULL,
+    event     TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX ix_to_device_inbox_user ON to_device_inbox(user, inbox_id);
