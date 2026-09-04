@@ -45,7 +45,8 @@ use crate::{AppState, error_response, lock_app};
 /// How long the CSAPI `/join` request blocks waiting for the worker to ground
 /// the fetched state DAG and apply our join. On timeout the client gets an
 /// error but the drain keeps running (a later sync will show the join).
-const JOIN_INGEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Configurable — see [`neutrino_ctl::Config::join_ingest_timeout`] — because
+/// a crowd joining one room at once needs far longer than a lone joiner.
 
 /// Cloneable outcome of a join dance, published to every attached waiter.
 /// `Ok` means our join is grounded in current state.
@@ -64,7 +65,8 @@ pub(crate) async fn federated_join(
     room_id: &RoomId,
     candidates: &[OwnedServerName],
 ) -> Response {
-    federated_join_with(state, user, room_id, candidates, JOIN_INGEST_TIMEOUT).await
+    let timeout = lock_app(state).config.join_ingest_timeout;
+    federated_join_with(state, user, room_id, candidates, timeout).await
 }
 
 /// As [`federated_join`], with the ingest-wait timeout injectable so a test can

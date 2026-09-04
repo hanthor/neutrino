@@ -24,6 +24,8 @@ const DEFAULT_OUTBOUND_CONCURRENCY: usize = 2;
 /// sender first drains its outbox backlog — spreads a fleet's restart-time
 /// retries so they don't flood the network in lockstep. Tests set this to 0.
 const DEFAULT_STARTUP_JITTER_MS: u64 = 30_000;
+/// See [`Config::join_ingest_timeout`].
+const DEFAULT_JOIN_INGEST_TIMEOUT_MS: u64 = 20_000;
 /// Default storage directory: a `data/` subdirectory of the process's working
 /// directory rather than the cwd itself, so the server never has to clamp the
 /// permissions of (or scatter its DB sidecars across) a directory it doesn't
@@ -68,6 +70,20 @@ pub struct Config {
     /// before its first outbox drain (thundering-herd guard on restart). Default
     /// 30s; tests set it to 0 so post-restart redelivery is immediate.
     pub startup_jitter: Duration,
+    /// How long a client's `/join` blocks while the worker grounds the room's
+    /// state and applies the join. On timeout the drain keeps running off the
+    /// request path, so the join usually lands anyway and the client is told
+    /// to retry.
+    ///
+    /// Default 20s, and measurement says leave it there: under a join storm
+    /// of 30 nodes at once, raising it to 60s only made the same join block
+    /// longer before reporting the same `504` — the membership had landed
+    /// either way — and at 50 at once neither value rescues the burst. What
+    /// fixes a storm is the client spreading its joins out and repeating on
+    /// `504` (companion #120). The knob keeps that trade — a slower failure
+    /// for fewer retries — an operator's to make, and lets the swarm harness
+    /// measure both. `NEUTRINO_JOIN_INGEST_TIMEOUT_MS`.
+    pub join_ingest_timeout: Duration,
     /// Whether client-facing reads (`/messages`, `/sync`) hide soft-failed
     /// events. `true` in production: a soft-failed event stays in the DAG but
     /// is invisible to clients. The soft-fail *verdict* is computed and stored
@@ -131,6 +147,7 @@ impl Default for Config {
             federation_proxy: None,
             lb_federation_port: None,
             startup_jitter: Duration::from_millis(DEFAULT_STARTUP_JITTER_MS),
+            join_ingest_timeout: Duration::from_millis(DEFAULT_JOIN_INGEST_TIMEOUT_MS),
             enable_soft_failure: true,
             trusted_network: true,
             log_dir: None,
@@ -159,6 +176,14 @@ impl Config {
             lb_federation_port: std::env::var("NEUTRINO_LB_FEDERATION_PORT")
                 .ok()
                 .and_then(|s| s.parse::<u16>().ok()),
+            join_ingest_timeout: std::env::var("NEUTRINO_JOIN_INGEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .map_or_else(
+                    || Duration::from_millis(DEFAULT_JOIN_INGEST_TIMEOUT_MS),
+                    Duration::from_millis,
+                ),
             startup_jitter: std::env::var("NEUTRINO_STARTUP_JITTER_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
