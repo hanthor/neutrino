@@ -918,6 +918,21 @@ fn build_router(state: &AppState) -> Router {
         // leaves a dangling "started processing request" line that is
         // indistinguishable from a hung handler.
         .layer(axum::middleware::from_fn(log_aborted_requests))
+        // Outermost: the spec requires web browser clients get CORS headers
+        // (spec.matrix.org, "Web browser clients") since the C-S API is
+        // Bearer-token authenticated, not cookie-based, so a permissive origin
+        // is the same tradeoff every homeserver makes. Without this, embedding
+        // hosts that serve their web client from a different origin than the
+        // loopback homeserver (e.g. a WebView on http://localhost talking to
+        // http://127.0.0.1:8008) get every request blocked client-side with a
+        // generic "Failed to fetch": the connection succeeds and the server
+        // answers, but the browser refuses to hand the response to JS.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
         // `AppState` is `Arc`-backed; this clone is the router's instance, the
         // caller keeps the other (e.g. `serve` hands its instance to `dispatch`).
         .with_state(state.clone())
@@ -3112,6 +3127,72 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A browser client on a different origin than the homeserver (an
+    /// embedding host's WebView on http://localhost talking to the loopback
+    /// node on http://127.0.0.1:8008, or any other web client) must get
+    /// `Access-Control-Allow-Origin` back, or the browser discards the
+    /// response before JS ever sees it — the request and the server both
+    /// succeed, but `fetch()` throws "Failed to fetch" regardless.
+    #[tokio::test]
+    async fn cross_origin_get_receives_cors_headers() {
+        use tower::ServiceExt;
+        let (state, _tmp) = test_state().await;
+        let request = axum::http::Request::builder()
+            .uri("/_matrix/client/versions")
+            .header("origin", "http://localhost")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = build_router(&state)
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-origin"),
+            "cross-origin GET must carry Access-Control-Allow-Origin: {:?}",
+            response.headers()
+        );
+    }
+
+    /// Browsers preflight non-"simple" requests (e.g. anything carrying an
+    /// `Authorization` header, which every authenticated Matrix C-S call
+    /// does) with an `OPTIONS` request before the real one. The router must
+    /// answer that itself — none of our routes handle `OPTIONS`.
+    #[tokio::test]
+    async fn preflight_options_request_is_answered() {
+        use tower::ServiceExt;
+        let (state, _tmp) = test_state().await;
+        let request = axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri("/_matrix/client/v3/createRoom")
+            .header("origin", "http://localhost")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = build_router(&state)
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert!(
+            response.status().is_success(),
+            "preflight must succeed: {}",
+            response.status()
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-methods")
+        );
     }
 
     #[tokio::test]
