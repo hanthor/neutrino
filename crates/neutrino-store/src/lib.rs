@@ -986,6 +986,41 @@ pub trait MediaStore: Send + Sync {
     ) -> Result<Option<StoredMedia>, StorageError>;
 }
 
+/// The local room directory: `#localpart:this_server` → room id.
+///
+/// Matrix aliases are server-scoped, so this holds only aliases in *our* own
+/// namespace; a peer's alias is resolved by asking that peer over federation,
+/// never from here. Claiming is first-write-wins so that the deterministic
+/// conference aliases — which every attendee's client races to create at the
+/// same moment — produce a conflict the loser can act on by joining instead.
+#[async_trait]
+pub trait AliasStore: Send + Sync {
+    /// Pre:  `alias` is a well-formed alias in this server's namespace.
+    /// Post: binds `alias` to `room_id` and returns `true`; returns `false`
+    ///       without changing anything if the alias is already claimed, even by
+    ///       the same room — the caller distinguishes "I created it" from
+    ///       "someone else did" and must not assume the latter is an error.
+    async fn put_alias(
+        &self,
+        alias: &str,
+        room_id: &RoomId,
+        created_by: &UserId,
+    ) -> Result<bool, StorageError>;
+
+    /// Pre:  none.
+    /// Post: the room `alias` names, or `None` if unclaimed here.
+    async fn resolve_alias(&self, alias: &str) -> Result<Option<OwnedRoomId>, StorageError>;
+
+    /// Pre:  none.
+    /// Post: removes the binding if `requester` created it, returning `true`;
+    ///       `false` if it is absent or belongs to someone else.
+    async fn delete_alias(&self, alias: &str, requester: &UserId) -> Result<bool, StorageError>;
+
+    /// Pre:  none.
+    /// Post: every alias bound to `room_id` here, sorted, for `/aliases`.
+    async fn aliases_for_room(&self, room_id: &RoomId) -> Result<Vec<String>, StorageError>;
+}
+
 /// Combined storage interface. Use as a generic bound: `S: StorageBackend`.
 pub trait StorageBackend:
     RoomStore
@@ -1002,6 +1037,7 @@ pub trait StorageBackend:
     + AccountDataStore
     + SessionStore
     + MediaStore
+    + AliasStore
 {
 }
 
@@ -1020,6 +1056,7 @@ impl<T> StorageBackend for T where
         + AccountDataStore
         + SessionStore
         + MediaStore
+        + AliasStore
 {
 }
 

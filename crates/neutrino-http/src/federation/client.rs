@@ -486,6 +486,38 @@ impl FederationClient {
         parse_2xx::<MakeJoinResponse>(resp, dest, "GET /make_join").await
     }
 
+    /// `GET http://{dest}/_matrix/federation/v1/query/directory?room_alias=…`
+    ///
+    /// Ask the alias's own server which room it names. Matrix aliases are
+    /// server-scoped, so this is the *only* way to resolve one we do not hold:
+    /// without it a deterministic conference alias is unresolvable off the
+    /// server that created it, and every attendee's client creates its own
+    /// room instead of converging on one.
+    pub(crate) async fn query_directory(
+        &self,
+        dest: &ServerName,
+        room_alias: &str,
+    ) -> Result<QueryDirectoryResponse, FederationClientError> {
+        info!(target: "neutrino_http", %dest, %room_alias, "outbound GET /_matrix/federation/v1/query/directory");
+        let mut url = reqwest::Url::parse(&format!(
+            "http://{}/_matrix/federation/v1/query/directory",
+            self.url_authority(dest)
+        ))
+        .map_err(|_| FederationClientError::InvalidUrl)?;
+        url.query_pairs_mut().append_pair("room_alias", room_alias);
+
+        let resp = self
+            .http
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, self.x_matrix(dest))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(non_2xx_error(resp, dest, "GET /query/directory").await);
+        }
+        parse_2xx::<QueryDirectoryResponse>(resp, dest, "GET /query/directory").await
+    }
+
     /// `PUT http://{dest}/_matrix/federation/v2/send_join/{room}/{event_id}`
     /// carrying the completed membership `event` — the second half of the join
     /// handshake. Returns the MSC4242 `{ state_dag, timeline, event }` response.
@@ -684,6 +716,17 @@ struct InviteRequest<'a> {
     event: &'a RawJsonValue,
     room_version: &'a str,
     invite_room_state: &'a [Value],
+}
+
+/// Deserialized `query/directory` response: which room an alias names, and the
+/// servers said to be in it. `servers` is advisory — we join via the alias's
+/// own server — so it is accepted and ignored rather than required.
+#[derive(Deserialize)]
+pub(crate) struct QueryDirectoryResponse {
+    pub(crate) room_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) servers: Vec<String>,
 }
 
 /// Deserialized `make_join` response (mirror of the inbound

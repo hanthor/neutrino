@@ -19,7 +19,7 @@ use neutrino_room::CoreError;
 use neutrino_room::provider::InMemoryStateProvider;
 use neutrino_room::room_core::{Effect, RoomCore};
 use neutrino_store::{
-    E2eeStore, FederationOutbox, IdentityStore, RoomStore, StateStore, StorageError,
+    AliasStore, E2eeStore, FederationOutbox, IdentityStore, RoomStore, StateStore, StorageError,
 };
 use neutrino_store_sqlite::SqliteStore;
 use ruma::api::client::sync::sync_events::v5;
@@ -36,6 +36,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info, info_span, warn};
 
 mod account_data;
+mod directory;
 mod e2ee;
 mod ephemeral;
 mod federation;
@@ -794,6 +795,10 @@ fn build_router(state: &AppState) -> Router {
             post(membership::join_by_id_or_alias),
         )
         .route(
+            "/_matrix/client/v3/directory/room/{alias}",
+            get(directory::get_alias).put(directory::put_alias),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/leave",
             post(membership::leave),
         )
@@ -834,6 +839,10 @@ fn build_router(state: &AppState) -> Router {
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
             put(federation::send::handle),
+        )
+        .route(
+            "/_matrix/federation/v1/query/directory",
+            get(federation::query_directory::handle),
         )
         .route(
             "/_matrix/federation/v1/backfill/{room_id}",
@@ -2338,7 +2347,37 @@ async fn create_room(
         }
     }
 
-    (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+    // Claim `room_alias_name` if one was asked for. This used to be dropped
+    // silently: createRoom returned 200 with a room nobody could ever find by
+    // name, which is exactly how an organiser tool "succeeds" while creating
+    // rooms no attendee converges on.
+    //
+    // A lost race is reported rather than hidden. The deterministic conference
+    // aliases are raced by every attendee at once, and the loser needs to know
+    // its room is unaliased so it can join the winner's instead.
+    let alias_outcome = match body.0.get("room_alias_name").and_then(Value::as_str) {
+        Some(localpart) if !localpart.is_empty() => {
+            let alias = format!("#{localpart}:{own_server}");
+            match store.put_alias(&alias, &room_id, &sender).await {
+                Ok(true) => Some(json!({ "room_alias": alias })),
+                Ok(false) => Some(json!({ "room_alias_error": "M_ROOM_IN_USE" })),
+                Err(e) => {
+                    tracing::warn!(target: "neutrino_http", %alias, %e, "createRoom: claiming alias failed");
+                    Some(json!({ "room_alias_error": "M_UNKNOWN" }))
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut out = json!({ "room_id": room_id });
+    if let (Some(extra), Some(obj)) = (alias_outcome, out.as_object_mut()) {
+        if let Some(extra) = extra.as_object() {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    (StatusCode::OK, Json(out)).into_response()
 }
 
 /// The validated `invite` targets from a createRoom body, minus the creator and

@@ -299,10 +299,26 @@ pub(crate) async fn join_by_id_or_alias(
     RawQuery(query): RawQuery,
     body: OptionalBody,
 ) -> axum::response::Response {
-    if RoomAliasId::parse(&room_id_or_alias).is_ok() {
-        return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No such room alias");
-    }
-    let room = match parse_room(&room_id_or_alias) {
+    // An alias is resolved to a room id first — locally if it is ours, else by
+    // asking the server named in it. This used to be an unconditional 404,
+    // which made the deterministic conference aliases unusable: every client
+    // derives the same `#event-session-id:server` and none of them could turn
+    // it into a room.
+    let mut alias_resident: Option<String> = None;
+    let target = if RoomAliasId::parse(&room_id_or_alias).is_ok() {
+        match crate::directory::resolve_for_join(&state.0, &room_id_or_alias).await {
+            Some((room_id, resident)) => {
+                alias_resident = resident;
+                room_id.to_string()
+            }
+            None => {
+                return error_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No such room alias");
+            }
+        }
+    } else {
+        room_id_or_alias.clone()
+    };
+    let room = match parse_room(&target) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -310,13 +326,22 @@ pub(crate) async fn join_by_id_or_alias(
     // plus the inviter's server from any pending invite (a v12 room id
     // carries no server, so without one of these we can only try locally,
     // which 404s an unknown room). On None, fall through to the local path.
-    let hints = crate::federation::join::parse_server_names(query.as_deref());
+    // An alias resolved remotely contributes its own server as a hint: that
+    // server holds the alias, so it is by definition in the room.
+    let mut hints = crate::federation::join::parse_server_names(query.as_deref());
+    if let Some(resident) = alias_resident {
+        if let Ok(name) = ruma::ServerName::parse(&resident) {
+            if !hints.contains(&name) {
+                hints.push(name);
+            }
+        }
+    }
     if let Some(resp) =
         crate::federation::join::federated_join_if_remote(&state.0, &auth.0, &room, &hints).await
     {
         return resp;
     }
-    join(state, auth, Path(room_id_or_alias), body).await
+    join(state, auth, Path(target), body).await
 }
 
 /// Shared body for the target-from-body endpoints (`invite`/`kick`/`ban`):
