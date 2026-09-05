@@ -2,6 +2,7 @@
 //! so each method's pre/post conditions map 1:1 to a file boundary.
 
 mod account_data;
+mod aliases;
 mod dag;
 mod deliveries;
 mod e2ee;

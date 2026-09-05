@@ -555,3 +555,24 @@ CREATE TABLE media (
     bytes         BLOB NOT NULL,
     PRIMARY KEY (origin, media_id)
 ) STRICT, WITHOUT ROWID;
+
+-- ----------------------------------------------------------------------------
+-- room_aliases — AliasStore (put_alias, resolve_alias, delete_alias)
+--
+-- The local room directory: `#localpart:this_server` → room id. Aliases are
+-- server-scoped in Matrix, so this table only ever holds aliases whose domain
+-- is *our* server name; a peer's alias is resolved by asking that peer over
+-- federation (`/_matrix/federation/v1/query/directory`), never from here.
+--
+-- The alias is the primary key, so a second claim on the same alias fails
+-- rather than silently repointing it — the deterministic conference aliases
+-- (`#indiafoss-2026-session-x:…`) are raced by every attendee's client at once,
+-- and the loser must see the conflict so it can join instead of create.
+-- ----------------------------------------------------------------------------
+CREATE TABLE room_aliases (
+    alias      TEXT NOT NULL PRIMARY KEY CHECK (alias <> ''),
+    room_id    TEXT NOT NULL,
+    created_by TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX room_aliases_by_room ON room_aliases (room_id);
