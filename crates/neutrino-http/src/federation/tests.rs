@@ -6095,6 +6095,47 @@ async fn direct_to_device_edu_reaches_the_local_inbox() {
 }
 
 #[tokio::test]
+async fn inbound_transaction_kicks_the_outbound_backoff() {
+    // A radio mesh has exactly one signal that a flapped link is back: the
+    // peer being heard from. An authenticated /send must pulse the sender
+    // kick so our own outbox stops waiting out a doubled backoff toward the
+    // fifteen-minute cap — the recipient's restart advertisement is often the
+    // very transaction proving it is reachable again. Rate-limited: a second
+    // transaction inside the floor must NOT pulse again, or a chatty peer
+    // disables backoff toward genuinely dead ones.
+    let (store, tmp) = fresh_store().await;
+    let app_state = crate::AppState::from_store(
+        {
+            let mut cfg = config();
+            cfg.storage_dir = tmp.path().to_path_buf();
+            cfg
+        },
+        store,
+    );
+    let app = crate::build_router(&app_state);
+    let mut kick_rx = app_state.subscribe_kick();
+    kick_rx.borrow_and_update();
+
+    let edus = json!([{
+        "edu_type": "m.typing",
+        "content": { "room_id": "!r:remote.example.org", "user_id": peer_user().as_str(), "typing": true },
+    }]);
+    assert_eq!(send_edus(&app, "kick-1", edus.clone()).await, StatusCode::OK);
+    assert!(
+        kick_rx.has_changed().expect("kick sender alive"),
+        "an authenticated inbound transaction must kick the outbound backoff"
+    );
+    kick_rx.borrow_and_update();
+
+    // Inside the rate-limit floor: no second pulse.
+    assert_eq!(send_edus(&app, "kick-2", edus).await, StatusCode::OK);
+    assert!(
+        !kick_rx.has_changed().expect("kick sender alive"),
+        "a second transaction inside the rate-limit floor must not pulse again"
+    );
+}
+
+#[tokio::test]
 async fn room_key_request_edus_cross_the_mesh_in_both_directions() {
     // The transport contract behind UTD self-healing (companion #182, part 2):
     // when a client cannot decrypt, matrix-rust-sdk emits `m.room_key_request`
