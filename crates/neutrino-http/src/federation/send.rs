@@ -174,7 +174,7 @@ pub(crate) async fn handle(
     // so a resent transaction does not deliver the same room key twice; an
     // EDU-only transaction stages nothing, records itself as seen, and is
     // therefore deduped by exactly the same path as one carrying events.
-    deliver_edus(&state, &our_name, &body.edus);
+    let deposited_to_device = deliver_edus(&state, &our_name, &body.edus);
 
     // Parse + dedup by event_id, then durably stage each PDU. A PDU that fails
     // `from_wire` is unkeyable (no derivable id) and cannot appear in the
@@ -299,8 +299,26 @@ pub(crate) async fn handle(
         pdus.insert(id, result);
     }
 
+    // Extend the never-lose ordering to to-device EDUs. A room-key deposit is
+    // journaled to an async write-through task, so without this barrier a
+    // room key could still be in flight to disk when we record the transaction
+    // as seen below — and a crash in that window would lose the key while the
+    // whole-transaction dedup permanently swallows the sender's resend, leaving
+    // the recipient unable to ever decrypt the message. Flush makes the key
+    // durable first, so if we never reach `record_federation_txn` the resend
+    // re-delivers it.
+    if deposited_to_device {
+        // Two statements, deliberately: the app guard must drop before the
+        // await (a std MutexGuard is not Send, and holding it across the
+        // flush would also block every other handler on the app lock for the
+        // duration of a disk write).
+        let e2ee = lock_app(&state).e2ee.clone();
+        e2ee.flush().await;
+    }
+
     // Record the transaction as processed only now that its PDUs are durably
-    // staged (and only if all of them are) — the never-lose ordering.
+    // staged (and only if all of them are), and any room key it carried is
+    // durable (above) — the never-lose ordering.
     if all_staged {
         store
             .record_federation_txn(&origin, &txn_id)
@@ -365,6 +383,10 @@ pub(crate) async fn handle(
 
 /// Apply the EDUs this server implements, ignoring the rest.
 ///
+/// Returns `true` if at least one `m.direct_to_device` message was deposited
+/// into the local inbox — the caller flushes to-device durability before
+/// recording the transaction as seen only when there is a room key to lose.
+///
 /// - `m.direct_to_device`: deposit each message into the local to-device
 ///   inbox — the receiving half of mesh E2EE. Messages addressed to users we
 ///   do not own are dropped rather than relayed onward: we are not a router
@@ -374,9 +396,10 @@ pub(crate) async fn handle(
 /// - `m.receipt`: a peer's user's read position moved.
 ///
 /// Presence is not implemented and is dropped.
-fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
+fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) -> bool {
     use serde_json::Value;
 
+    let mut deposited = false;
     for raw in edus {
         let Ok(edu) = serde_json::from_str::<Value>(raw.get()) else {
             continue;
@@ -427,8 +450,10 @@ fn deliver_edus(state: &AppState, our_name: &str, edus: &[Box<RawJsonValue>]) {
                 continue;
             };
             e2ee.push_to_devices(user, devices, &event_type, &sender);
+            deposited = true;
         }
     }
+    deposited
 }
 
 /// `m.device_list_update` content: `{ user_id, device_id, stream_id, ... }`.
