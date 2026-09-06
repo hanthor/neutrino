@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use neutrino_store::{E2eeSnapshot, E2eeStore};
 use serde_json::value::RawValue as RawJsonValue;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::error;
 
 /// One write-through, applied to the store in the order it was journaled.
@@ -66,6 +66,24 @@ pub(crate) enum Op {
         user: String,
         stream_id: u64,
     },
+    /// A durability barrier. The persistence task processes ops in order, so a
+    /// `Flush` signals its oneshot only once every op queued before it has been
+    /// written to the store. [`E2eeState::flush`] awaits that signal — the way
+    /// the federation `/send` handler makes a room-key to-device EDU durable
+    /// before it records the transaction as seen (without which a crash there
+    /// loses the key while dedup permanently blocks the sender's resend).
+    Flush(FlushSignal),
+}
+
+/// Carries a `flush` completion signal through the ordered journal. A newtype
+/// so [`Op`] can keep `#[derive(Debug)]` — a bare `oneshot::Sender` is not
+/// `Debug`, and the persistence task logs the op on a store error.
+pub(crate) struct FlushSignal(pub(crate) oneshot::Sender<()>);
+
+impl std::fmt::Debug for FlushSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlushSignal")
+    }
 }
 
 fn raw(value: &Value) -> Box<RawJsonValue> {
@@ -442,6 +460,16 @@ impl E2eeState {
         self.lock().keys.journal = Some(tx);
         tokio::spawn(async move {
             while let Some(op) = rx.recv().await {
+                // A barrier, not a store write: every op queued before it has
+                // already been drained from this in-order channel, so signalling
+                // now means they are durable. Signal and move on.
+                let op = match op {
+                    Op::Flush(FlushSignal(done)) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                    other => other,
+                };
                 let result = match &op {
                     Op::PutDevice { user, device, keys } => {
                         store.put_device_keys(user, device, keys).await
@@ -467,6 +495,9 @@ impl E2eeState {
                     Op::SetDeviceStream { user, stream_id } => {
                         store.put_device_stream(user, *stream_id).await
                     }
+                    // Consumed by the rebind above; the arm exists only for
+                    // exhaustiveness.
+                    Op::Flush(_) => Ok(()),
                 };
                 if let Err(e) = result {
                     error!(error = %e, ?op, "persisting E2EE state");
@@ -584,6 +615,29 @@ impl E2eeState {
         self.lock().keys.device_seq
     }
 
+    /// Block until every journaled mutation queued so far is durably in the
+    /// store. A no-op when no persistence is attached (unit tests, or before
+    /// `attach_persistence`). Used by the federation `/send` handler to make a
+    /// room-key to-device EDU durable before the transaction is recorded as
+    /// seen: the ordered journal guarantees the key's `PushToDevice` write
+    /// precedes this barrier, so once `flush` returns the key survives a crash
+    /// and a resend can never be deduped past a key that was never stored.
+    pub(crate) async fn flush(&self) {
+        let journal = self.lock().keys.journal.clone();
+        let Some(journal) = journal else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        if journal.send(Op::Flush(FlushSignal(tx))).is_err() {
+            // The persistence task is gone (shutdown). Nothing more can be
+            // written, so there is nothing to wait for.
+            return;
+        }
+        // A dropped sender (task died between send and processing) resolves the
+        // await with an error; either way we stop blocking.
+        let _ = rx.await;
+    }
+
     /// Users whose device list changed after `since`.
     pub(crate) fn device_changes_since(&self, since: u64) -> Vec<String> {
         self.lock().keys.device_changes_since(since)
@@ -641,5 +695,112 @@ impl E2eeState {
             });
         }
         min.unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use neutrino_store::StorageError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Semaphore;
+
+    /// An `E2eeStore` whose `push_to_device` blocks on a semaphore the test
+    /// controls, so we can observe whether `flush` waits for a to-device write
+    /// to reach the store. Every other method is an inert `Ok`.
+    struct GatedStore {
+        /// Held at 0 permits until the test releases one — `push_to_device`
+        /// cannot complete (become durable) until then.
+        gate: Semaphore,
+        /// Flipped true once `push_to_device` has actually run: the "durable"
+        /// marker the test asserts on.
+        written: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl E2eeStore for GatedStore {
+        async fn load_e2ee(&self) -> Result<E2eeSnapshot, StorageError> {
+            Ok(E2eeSnapshot::default())
+        }
+        async fn put_device_keys(&self, _: &str, _: &str, _: &RawJsonValue) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn put_one_time_keys(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[(String, Box<RawJsonValue>)],
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn remove_one_time_key(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn put_cross_signing(&self, _: &str, _: &RawJsonValue) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn put_device_stream(&self, _: &str, _: u64) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn push_to_device(
+            &self,
+            _: i64,
+            _: &str,
+            _: &str,
+            _: &RawJsonValue,
+        ) -> Result<(), StorageError> {
+            // Block until the test opens the gate: stands in for a to-device
+            // write that has not yet reached disk.
+            let _permit = self.gate.acquire().await.expect("semaphore open");
+            self.written.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn remove_to_device(&self, _: &[i64]) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    /// `flush` must not return until a queued to-device write is durable. This
+    /// is the invariant the federation `/send` handler leans on to avoid
+    /// recording a transaction as seen before its room key is on disk.
+    #[tokio::test]
+    async fn flush_blocks_until_the_to_device_write_is_durable() {
+        let store = Arc::new(GatedStore {
+            gate: Semaphore::new(0),
+            written: AtomicBool::new(false),
+        });
+        let e2ee = Arc::new(E2eeState::new());
+        e2ee.attach_persistence(store.clone());
+
+        // Queue a room key. Memory changes now; the store write is gated.
+        e2ee.push_to_device(
+            "@alice:example.org",
+            "PHONE",
+            "m.room_key",
+            "@peer:remote.example.org",
+            json!({ "session_id": "S1" }),
+        );
+
+        // flush() must still be pending while the write is gated.
+        let flusher = e2ee.clone();
+        let mut flush = Box::pin(async move { flusher.flush().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut flush)
+                .await
+                .is_err(),
+            "flush returned before the gated to-device write could be durable"
+        );
+        assert!(
+            !store.written.load(Ordering::SeqCst),
+            "the write ran despite the gate being shut"
+        );
+
+        // Open the gate; the write completes and flush must now return.
+        store.gate.add_permits(1);
+        flush.await;
+        assert!(
+            store.written.load(Ordering::SeqCst),
+            "flush returned but the to-device write never reached the store"
+        );
     }
 }

@@ -6095,6 +6095,134 @@ async fn direct_to_device_edu_reaches_the_local_inbox() {
 }
 
 #[tokio::test]
+async fn room_key_request_edus_cross_the_mesh_in_both_directions() {
+    // The transport contract behind UTD self-healing (companion #182, part 2):
+    // when a client cannot decrypt, matrix-rust-sdk emits `m.room_key_request`
+    // to-device events, and a holder answers with `m.forwarded_room_key`. The
+    // server's whole job is to carry both verbatim — never to special-case
+    // them. Whether anything *answers* is client policy (today the SDK asks
+    // only the user's own devices); this pins the pipe so healing works the
+    // moment a device exists to answer.
+    let (store, tmp) = fresh_store().await;
+    let app = router_with_store(
+        {
+            let mut cfg = config();
+            cfg.storage_dir = tmp.path().to_path_buf();
+            cfg
+        },
+        store.clone(),
+    );
+
+    // Inbound: a peer's request for one of our user's keys lands in the local
+    // inbox exactly as sent.
+    let status = send_edus(
+        &app,
+        "edu-keyreq-in",
+        json!([{
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": peer_user().as_str(),
+                "type": "m.room_key_request",
+                "message_id": "req-1",
+                "messages": { alice().as_str(): { "PHONE": {
+                    "action": "request",
+                    "request_id": "R1",
+                    "requesting_device_id": "PEERPHONE",
+                    "body": { "algorithm": "m.megolm.v1.aes-sha2", "session_id": "S-lost" },
+                } } },
+            },
+        }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sync_to_device(&app).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "m.room_key_request");
+    assert_eq!(events[0]["content"]["action"], "request");
+    assert_eq!(events[0]["content"]["body"]["session_id"], "S-lost");
+
+    // Outbound: our client answering (or asking) queues durably for the peer,
+    // same as any room key — out of BLE range now still means delivered later.
+    let body = json!({ "messages": { peer_user().as_str(): { "PEERPHONE": {
+        "action": "request",
+        "request_id": "R2",
+        "requesting_device_id": "PHONE",
+        "body": { "algorithm": "m.megolm.v1.aes-sha2", "session_id": "S-mine" },
+    } } } });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/client/v3/sendToDevice/m.room_key_request/txn-keyreq")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let (status, _) = drive(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dest: &ServerName = TEST_PEER.try_into().unwrap();
+    let queued = store.pending_edus(dest, usize::MAX).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    let edu: Value = serde_json::from_str(queued[0].raw.get()).unwrap();
+    assert_eq!(edu["edu_type"], "m.direct_to_device");
+    assert_eq!(edu["content"]["type"], "m.room_key_request");
+    assert_eq!(
+        edu["content"]["messages"][peer_user().as_str()]["PEERPHONE"]["request_id"],
+        "R2"
+    );
+}
+
+#[tokio::test]
+async fn room_key_is_durable_by_the_time_the_transaction_is_acked() {
+    // The regression behind "Waiting for this message" forever (companion
+    // #182): the to-device deposit rides an async write-through journal while
+    // the transaction record is a direct write, so a room key could still be
+    // in flight to disk when /send acked — and a crash in that window lost the
+    // key while the whole-transaction dedup swallowed the sender's resend.
+    // The contract under test: when /send returns 200 for a transaction that
+    // carried a room key, that key is already in the *store*, not just memory.
+    let (store, tmp) = fresh_store().await;
+    let app = router_with_store(
+        {
+            let mut cfg = config();
+            cfg.storage_dir = tmp.path().to_path_buf();
+            cfg
+        },
+        store.clone(),
+    );
+
+    let status = send_edus(
+        &app,
+        "edu-durable",
+        json!([{
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": peer_user().as_str(),
+                "type": "m.room_key",
+                "message_id": "m1",
+                "messages": { alice().as_str(): { "PHONE": { "session_id": "S-durable" } } },
+            },
+        }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Straight to the store, bypassing memory: this is what a restarted
+    // process would reload. The key must already be there.
+    let snapshot = neutrino_store::E2eeStore::load_e2ee(store.as_ref())
+        .await
+        .expect("load snapshot");
+    assert_eq!(
+        snapshot.to_device.len(),
+        1,
+        "the acked room key must be durable at ack time, not en route to disk"
+    );
+    let (_, user, device, event) = &snapshot.to_device[0];
+    assert_eq!(user, alice().as_str());
+    assert_eq!(device, "PHONE");
+    let event: Value = serde_json::from_str(event.get()).expect("stored event parses");
+    assert_eq!(event["content"]["session_id"], "S-durable");
+}
+
+#[tokio::test]
 async fn resent_transaction_does_not_deliver_the_edu_twice() {
     let (app, _tmp) = test_router().await;
     let edus = json!([{
