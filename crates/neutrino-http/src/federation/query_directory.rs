@@ -37,8 +37,8 @@ pub(crate) async fn handle(state: State<AppState>, Query(params): Query<Params>)
     // Refuse another server's namespace explicitly rather than returning "not
     // found": the caller has asked the wrong server, and saying so is the
     // difference between a bug it can see and an alias it thinks is free.
-    match params.room_alias.rsplit_once(':') {
-        Some((_, domain)) if domain == own_server => {}
+    match alias_domain(&params.room_alias) {
+        Some(domain) if domain == own_server => {}
         Some(_) => {
             return error_response(
                 StatusCode::NOT_FOUND,
@@ -69,5 +69,44 @@ pub(crate) async fn handle(state: State<AppState>, Query(params): Query<Params>)
             "M_UNKNOWN",
             &format!("resolving alias: {e}"),
         ),
+    }
+}
+
+/// The server part of `#localpart:server`, or `None` if it is not an alias.
+///
+/// Split on the *first* colon, not the last. A localpart cannot contain a
+/// colon but a server name can — `#session:127.0.0.1:8008` is an ordinary
+/// alias on a server with a port — and splitting from the right reads that
+/// domain as `8008`, so the server refuses to answer for its own namespace.
+/// Mesh server names are 64 hex characters with no colon in them, which is
+/// why this survived every test on the mesh and broke the moment two ported
+/// nodes federated.
+fn alias_domain(alias: &str) -> Option<&str> {
+    let rest = alias.strip_prefix('#')?;
+    let (localpart, domain) = rest.split_once(':')?;
+    if localpart.is_empty() || domain.is_empty() {
+        return None;
+    }
+    Some(domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::alias_domain;
+
+    #[test]
+    fn keeps_the_port_in_a_server_name() {
+        assert_eq!(alias_domain("#s:127.0.0.1:8008"), Some("127.0.0.1:8008"));
+        assert_eq!(alias_domain("#s:example.org"), Some("example.org"));
+        // A mesh node id: 64 hex, no colon.
+        let node = "0".repeat(64);
+        assert_eq!(alias_domain(&format!("#s:{node}")).map(str::to_owned), Some(node));
+    }
+
+    #[test]
+    fn rejects_what_is_not_an_alias() {
+        for bad in ["", "#", "#s", "s:example.org", "#:example.org", "#s:"] {
+            assert_eq!(alias_domain(bad), None, "{bad}");
+        }
     }
 }

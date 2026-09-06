@@ -15,7 +15,7 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 | POST | `/_matrix/client/{version}/register` | two-step UIA stub, per-user token |
 | POST | `/_matrix/client/unstable/org.matrix.simplified_msc3575/sync` | MSC4186 |
 | GET | `/_matrix/client/v3/sync` | legacy → MSC4186 translator; MSC4222 `state_after` dual-emitted; `invite`/`leave`+`ban`/`knock` buckets handled; **ignores `?filter=`** |
-| POST | `/_matrix/client/v3/createRoom` | honours `preset`/`visibility`/`invite[]`(+`is_direct`)/`name`/`topic`; **drops** `room_alias_name`, arbitrary `initial_state`, `power_level_content_override`, `creation_content`, `room_version` (no rejection — unknown versions still 200) |
+| POST | `/_matrix/client/v3/createRoom` | honours `preset`/`visibility`/`invite[]`(+`is_direct`)/`name`/`topic`/`room_alias_name` (claims it first-write-wins and returns `room_alias`, or `room_alias_error` when the claim lost); **drops** arbitrary `initial_state`, `power_level_content_override`, `creation_content`, `room_version` (no rejection — unknown versions still 200) |
 | GET | `/_matrix/client/v3/capabilities` | `m.room_versions.default = "12"` |
 | GET | `/_matrix/client/v3/rooms/{room_id}/members` | **ignores** `at` / `membership` / `not_membership` filters |
 | PUT | `/_matrix/client/v3/rooms/{room_id}/send/{type}/{msg_id}` | message events |
@@ -32,7 +32,10 @@ From `crates/neutrino-http/src/lib.rs:201-277`. The Complement image is built wi
 
 **Still NOT wired** (these gate tests below):
 - No `POST /user/{uid}/filter` (+ `GET …/filter/{id}`) — blocks the large filtered-`/sync` tranche.
-- No `/joined_members`, `/joined_rooms`, `/publicRooms`, `/directory/room/{alias}` (no room directory).
+- No `/joined_members`, `/joined_rooms`, `/publicRooms`.
+- `GET`/`PUT` `/directory/room/{alias}` now exist, and `POST /join/{alias}`
+  resolves — locally, and over federation via
+  `GET /_matrix/federation/v1/query/directory` for another server's namespace.
 - No `/forget`, `/upgrade`, profile/displayname/avatar writes, account_data writes (so no `/read_markers`).
 - No `/devices` management. (`m.device_list_update` and `device_lists.changed` landed 2026-09-03 for device changes; membership-driven `changed`/`left` are not derived — see the allowlist's last block.)
 - 404 fallback returns plain text, not `{"errcode":"M_UNRECOGNIZED"}`.
@@ -134,3 +137,28 @@ Join-gated pagination over `EventStore::room_messages` (`dir`/`from`/`to`/`limit
 4. **`GET /rooms/{room}/event/{eventId}`** → history-visibility fetch + power-levels-by-id tests.
 5. **Teach `scripts/complement.sh` to also run `./tests/msc4222/...`** → the marquee MSC4222 `state_after` dual-emission validation (`tests/msc4222/TestSync/*`), currently unreachable because the runner is csapi-only.
 6. **404 fallback → `{"errcode":"M_UNRECOGNIZED"}`** → `TestUnknownEndpoints/*`, and correct per spec.
+
+## Aliases and the room directory (added 2026-09-05, not yet re-run)
+
+Room aliases landed after the 2026-06-02 audit, so the entries above that call
+the directory missing are corrected in place. **No Complement run has confirmed
+which tests this unblocks**, and nothing has been added to `allowlist.txt` on
+the strength of it — an allowlist entry that has not been observed passing is
+worse than no entry, because it turns a real regression into an expected
+failure nobody looks at.
+
+Candidates to try on the next run, all previously excluded for "no room
+directory":
+
+- `TestRoomState/…/GET /directory/room…`
+- the `createRoom` `room_alias_name` subtests
+- anything that joined by alias and was blocked on `POST /join/{alias}`
+  answering 404 for a valid alias
+
+What is verified, outside Complement, is the two-server path the conference
+depends on: one node claims `#session:server`, another resolves it over
+federation to the same room id and joins into that room, with the claim
+first-write-wins so a second claimant is told it lost rather than repointing
+the alias. That is asserted on every CI run of the companion's live-Neutrino
+job (`tools/neutrino-probe/src/aliases.e2e.test.ts`), against two nodes whose
+server names carry ports.
