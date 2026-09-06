@@ -490,7 +490,21 @@ impl E2eeState {
                         user,
                         device,
                         event,
-                    } => store.push_to_device(*id, user, device, event).await,
+                    } => {
+                        // Fault injection for durability tests: widen the
+                        // window between "key in memory" and "key on disk" so
+                        // a harness can land a crash inside it. The window is
+                        // real on slow flash under load; this makes it
+                        // reproducible on a fast idle box. Test-only: unset
+                        // (the default) means zero added latency.
+                        if let Some(ms) = std::env::var("NEUTRINO_TEST_SLOW_JOURNAL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        }
+                        store.push_to_device(*id, user, device, event).await
+                    }
                     Op::RemoveToDevice { ids } => store.remove_to_device(ids).await,
                     Op::SetDeviceStream { user, stream_id } => {
                         store.put_device_stream(user, *stream_id).await
