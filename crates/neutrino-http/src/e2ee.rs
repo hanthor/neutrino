@@ -501,6 +501,16 @@ impl E2eeState {
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
                         {
+                            // A marker a durability harness can watch for to
+                            // kill the process *inside* the window — the key is
+                            // in memory (and, unfixed, already acked) but not
+                            // yet on disk. Deterministic where wall-clock
+                            // timing across a flaky link is not.
+                            tracing::warn!(
+                                target: "neutrino_test",
+                                %user, %device,
+                                "TEST: to-device journal window open"
+                            );
                             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                         }
                         store.push_to_device(*id, user, device, event).await
