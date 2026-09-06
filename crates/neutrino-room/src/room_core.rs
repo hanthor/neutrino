@@ -265,9 +265,34 @@ impl RoomCore {
         content: Value,
         signer: Option<&Arc<neutrino_event::EventSigner>>,
     ) -> Result<Event, FormatError> {
-        let prev_events: Vec<OwnedEventId> = self.forward_extremities.iter().cloned().collect();
-        let prev_state_events: Vec<OwnedEventId> =
-            self.state_forward_extremities.iter().cloned().collect();
+        // Reference at most 20 heads — the PDU schema's cap, which the
+        // validator enforces. A join storm leaves more: every join templated
+        // against the same heads lands as a sibling extremity, and a hall
+        // joining a session room over a real link put a room past 20 heads in
+        // one afternoon of testing. Referencing *all* heads would make this
+        // build fail validation — which is what happened, and since nothing
+        // else merges heads, every later send failed too: the room was
+        // permanently unwritable by its own members, 400 on every message,
+        // while federation carried on normally around it.
+        //
+        // So cap, the way Synapse does: pick 20, and leave the rest as
+        // extremities. `apply` removes only the parents an event lists, so the
+        // unreferenced heads survive this event and the next one absorbs them
+        // — a few messages after the storm, the DAG has converged. Which 20 is
+        // immaterial for correctness (any event is eventually referenced); the
+        // BTreeSet's order makes the choice deterministic.
+        let prev_events: Vec<OwnedEventId> = self
+            .forward_extremities
+            .iter()
+            .take(neutrino_event::MAX_PREV_EVENTS)
+            .cloned()
+            .collect();
+        let prev_state_events: Vec<OwnedEventId> = self
+            .state_forward_extremities
+            .iter()
+            .take(neutrino_event::MAX_PREV_STATE_EVENTS)
+            .cloned()
+            .collect();
         let mut builder = EventBuilder::new(sender, event_type, self.version.clone())
             .room_id(self.room_id.clone())
             .content(content)
@@ -602,6 +627,48 @@ fn current_state_delta(old: &StateMap<Arc<Event>>, new: &StateMap<OwnedEventId>)
 mod tests {
     use super::*;
     use crate::provider::InMemoryStateProvider;
+
+    /// A join storm's aftermath: more than 20 timeline heads. `build_local_event`
+    /// must cap `prev_events` at the schema's 20 rather than reference every
+    /// head and fail validation — which bricked the room for its own members:
+    /// every send answered 400 until restart, since nothing else merges heads.
+    /// The unreferenced heads stay extremities for the next event to absorb.
+    #[test]
+    fn build_local_event_caps_prev_events_at_the_schema_limit() {
+        let create = create_event("@alice:example.org");
+        let provider = InMemoryStateProvider::new();
+        let mut room = RoomCore::new(create.room_id.clone(), neutrino_event::base_version().clone());
+        room.apply_pdu(create.clone(), &provider).expect("create applies");
+        // Fabricate a 25-head room directly: the sets are the unit under test,
+        // and marching 25 concurrent joins through apply here would test apply,
+        // not the builder.
+        for i in 0..25 {
+            room.forward_extremities
+                .insert(format!("$head{i:02}").try_into().expect("event id"));
+        }
+        let event = room
+            .build_local_event(
+                "@alice:example.org".parse().expect("user"),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({ "body": "after the storm" }),
+                None,
+            )
+            .expect("a 25-head room must still accept a local event");
+        assert_eq!(event.prev_events.len(), neutrino_event::MAX_PREV_EVENTS);
+        // Determinism: same heads, same choice.
+        let again = room
+            .build_local_event(
+                "@alice:example.org".parse().expect("user"),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({ "body": "after the storm" }),
+                None,
+            )
+            .expect("build");
+        assert_eq!(event.prev_events, again.prev_events);
+    }
+
     use crate::test_utils::next_ts;
     use neutrino_event::ROOM_VERSION_ID;
     use neutrino_event::event_builder::EventBuilder;
