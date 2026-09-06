@@ -58,6 +58,10 @@ use neutrino_engine::{MissingEventsFetcher, RoomActorError, RoomRegistry};
 use neutrino_store::AccountDataStore;
 use sliding_sync::{SyncError, SyncState};
 
+/// Floor between inbound-traffic backoff kicks — see
+/// [`AppState::kick_backoff_rate_limited`].
+const INBOUND_KICK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct App {
     store: Arc<SqliteStore>,
     /// Per-room state-machine actors. CSAPI writes go through here so they
@@ -116,6 +120,9 @@ struct App {
     /// federation sender. Fired once by [`AppState::begin_shutdown`]; after
     /// that, every `cancelled().await` on any clone resolves immediately.
     shutdown: CancellationToken,
+    /// When the inbound-traffic kick last fired, for
+    /// [`AppState::kick_backoff_rate_limited`]'s rate limit.
+    last_inbound_kick: Option<std::time::Instant>,
     /// "Kick" signal shared with the outbound sender's per-destination tasks.
     /// [`AppState::kick_backoff`] pulses it; each task watches a clone and, on a
     /// change, resets its retry backoff to base and retries immediately. The
@@ -383,6 +390,7 @@ impl AppState {
             policy,
             config,
             shutdown,
+            last_inbound_kick: None,
             kick_backoff,
             joins: HashMap::new(),
             #[cfg(feature = "multi-user-shim")]
@@ -534,6 +542,25 @@ impl AppState {
         // after it subscribes interrupts its backoff — which is correct, since a
         // fresh task is already at base.
         lock_app(self).kick_backoff.send_modify(|_| {});
+    }
+
+    /// [`AppState::kick_backoff`], but at most once per
+    /// [`INBOUND_KICK_MIN_INTERVAL`]. The inbound federation path calls this on
+    /// every authenticated transaction — proof some peer link is alive — and
+    /// the limit is what keeps that from disabling backoff wholesale: a mesh
+    /// with one dead peer and one chatty one must not dial the dead one on
+    /// every message the chatty one sends.
+    pub(crate) fn kick_backoff_rate_limited(&self) {
+        use std::time::Instant;
+        let now = Instant::now();
+        {
+            let mut app = lock_app(self);
+            match app.last_inbound_kick {
+                Some(last) if now.duration_since(last) < INBOUND_KICK_MIN_INTERVAL => return,
+                _ => app.last_inbound_kick = Some(now),
+            }
+            app.kick_backoff.send_modify(|_| {});
+        }
     }
 
     /// A clone of the kick signal receiver, for a sender task spawned from

@@ -151,6 +151,18 @@ pub(crate) async fn handle(
         ));
     }
 
+    // An authenticated transaction from a peer is proof the link to that side
+    // of the mesh is alive again, so stop waiting out retry backoff. Radios
+    // flap: after a few failed sends the backoff doubles toward its
+    // fifteen-minute cap, and without this a healed link sat unused — the
+    // recipient's node was back (its restart advertisement is often the very
+    // transaction arriving here) while our outbox counted down minutes. The
+    // Android host has a connectivity kicker for the device's own network
+    // coming back; this is the mesh-side twin, driven by the only signal a
+    // radio mesh has — the peer being heard from. Rate-limited so a chatty
+    // mesh doesn't turn backoff off entirely for genuinely dead peers.
+    state.kick_backoff_rate_limited();
+
     // Cheap whole-transaction dedup: a re-sent transaction we've already fully
     // staged is acknowledged without re-staging. This is a read-only *check* —
     // the matching *record* happens only after staging succeeds (below), so a
