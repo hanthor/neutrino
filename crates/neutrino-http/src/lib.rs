@@ -2301,6 +2301,11 @@ async fn create_room(
     let (create, initial) =
         match build_initial_events(&sender, &body.0, &own_server, &display_name, &policy) {
             Ok(batch) => batch,
+            // The one client-authored failure gets a client-error status; the
+            // rest are server bugs (the events are server-authored) and 500.
+            Err(e @ CreateRoomError::BadInitialState(_)) => {
+                return error_response(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", &e.to_string());
+            }
             Err(e) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2411,6 +2416,11 @@ enum CreateRoomError {
     /// unreachable in practice, surfaced rather than panicked on.
     #[error("initial event produced no persist effect")]
     NotApplied,
+    /// An `initial_state` entry from the *request* was malformed or rejected
+    /// by the auth rules. Unlike every other variant this one is the client's
+    /// doing, so the handler answers 400, not 500.
+    #[error("initial_state: {0}")]
+    BadInitialState(String),
 }
 
 /// Pull the persisted (`auth_events`-stamped) event out of `apply_pdu`'s
@@ -2436,8 +2446,12 @@ fn persisted_event(effects: Vec<Effect>) -> Result<Arc<Event>, CreateRoomError> 
 ///
 /// `join_rules` is taken from the request's `preset` (or `visibility` when no
 /// preset is given — see [`join_rule_for`]); `history_visibility` is `shared`,
-/// which every standard preset agrees on. Aliases, guest access, and arbitrary
-/// `initial_state` / `power_level_content_override` overrides are not honoured.
+/// which every standard preset agrees on, unless the request's
+/// `initial_state` overrides it. `initial_state` entries are applied in
+/// order, auth-checked like everything else (`m.room.create` and
+/// `m.room.member` excluded); `m.room.encryption` arriving this way is how a
+/// stock client turns encryption on. Guest access and
+/// `power_level_content_override` are still not honoured.
 fn build_initial_events(
     sender: &OwnedUserId,
     body: &Value,
@@ -2495,6 +2509,47 @@ fn build_initial_events(
         "",
         json!({ "history_visibility": "shared" }),
     )?;
+    // The request's `initial_state`, applied after the preset tail (so an
+    // entry can override e.g. `history_visibility`) and before name/topic —
+    // the spec's ordering. This is what makes end-to-end encryption reachable
+    // from a stock client: Element X and the matrix-rust-sdk express
+    // "encrypted room" as an `m.room.encryption` entry here, and a server
+    // that drops it answers 200 with a *plaintext* room while the client
+    // believes otherwise. That silent downgrade is the worst failure this
+    // endpoint can produce, which is why entries are applied — through the
+    // same auth-checked path as everything above — rather than ignored, and
+    // why a malformed one fails the whole request rather than being skipped.
+    if let Some(entries) = body.pointer("/initial_state") {
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| CreateRoomError::BadInitialState("not an array".to_owned()))?;
+        for (i, entry) in entries.iter().enumerate() {
+            let bad =
+                |what: &str| CreateRoomError::BadInitialState(format!("entry {i}: {what}"));
+            let event_type = entry
+                .pointer("/type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad("missing type"))?;
+            // `m.room.create` cannot be restated, and membership has dedicated
+            // machinery (`invite`, and the join the creator already has) whose
+            // invariants an initial_state member event would bypass.
+            if event_type == "m.room.create" || event_type == "m.room.member" {
+                return Err(bad(&format!("{event_type} is not allowed here")));
+            }
+            let state_key = entry
+                .pointer("/state_key")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let content = entry.pointer("/content").cloned().unwrap_or_else(|| json!({}));
+            if !content.is_object() {
+                return Err(bad("content is not an object"));
+            }
+            // Client-authored content through the server's auth rules: a
+            // rejection here is the client's error, not a server bug.
+            add(event_type, state_key, content)
+                .map_err(|e| bad(&e.to_string()))?;
+        }
+    }
     if let Some(n) = body.pointer("/name").and_then(|v| v.as_str()) {
         add("m.room.name", "", json!({ "name": n }))?;
     }
@@ -3670,6 +3725,107 @@ mod tests {
             .map(|u| u.to_string())
             .collect();
         assert_eq!(targets, ["@bob:127.0.0.1", "@carol:remote.example"]);
+    }
+
+    #[test]
+    fn initial_state_turns_encryption_on_at_creation() {
+        // The stock-client path: matrix-rust-sdk expresses `isEncrypted` as an
+        // m.room.encryption entry in initial_state. Dropping it would answer
+        // 200 with a plaintext room the client believes is encrypted — the
+        // silent downgrade this endpoint must never produce.
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "initial_state": [
+                { "type": "m.room.encryption", "state_key": "",
+                  "content": { "algorithm": "m.megolm.v1.aes-sha2" } },
+            ],
+        });
+        let (_create, initial) = build_initial_events(
+            &sender,
+            &body,
+            "127.0.0.1",
+            "Alice",
+            &EventPolicy::trusted_network(),
+        )
+        .expect("build initial events");
+        let enc = initial
+            .iter()
+            .find(|e| e.event_type == "m.room.encryption")
+            .expect("encryption event present");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(enc.content.get())
+                .expect("content")
+                .pointer("/algorithm"),
+            Some(&json!("m.megolm.v1.aes-sha2")),
+        );
+    }
+
+    #[test]
+    fn initial_state_overrides_the_preset_tail_and_precedes_name() {
+        // Spec ordering: initial_state lands after the preset events — so an
+        // entry can override history_visibility — and before name/topic. The
+        // later event wins state, so order is the behaviour, not cosmetics.
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        let body = json!({
+            "name": "Named",
+            "initial_state": [
+                { "type": "m.room.history_visibility",
+                  "content": { "history_visibility": "invited" } },
+            ],
+        });
+        let (_create, initial) = build_initial_events(
+            &sender,
+            &body,
+            "127.0.0.1",
+            "Alice",
+            &EventPolicy::trusted_network(),
+        )
+        .expect("build initial events");
+        let positions: Vec<usize> = ["m.room.history_visibility", "m.room.name"]
+            .iter()
+            .map(|t| {
+                initial
+                    .iter()
+                    .rposition(|e| e.event_type == *t)
+                    .unwrap_or_else(|| panic!("{t} present"))
+            })
+            .collect();
+        assert!(positions[0] < positions[1], "override before name");
+        let visibilities: Vec<String> = initial
+            .iter()
+            .filter(|e| e.event_type == "m.room.history_visibility")
+            .filter_map(|e| e.content_str("history_visibility"))
+            .collect();
+        assert_eq!(visibilities.last().map(String::as_str), Some("invited"));
+    }
+
+    #[test]
+    fn initial_state_refuses_create_member_and_garbage() {
+        // Restating m.room.create is nonsense, membership has dedicated
+        // machinery whose invariants an initial_state entry would bypass, and
+        // an entry with no type has no meaning. Each is the client's error and
+        // must fail the request — a skipped entry would be another flavour of
+        // the silent downgrade.
+        let sender: OwnedUserId = "@alice:127.0.0.1".parse().expect("user id");
+        for entry in [
+            json!({ "type": "m.room.create", "content": {} }),
+            json!({ "type": "m.room.member", "state_key": "@bob:x", "content": {} }),
+            json!({ "content": { "algorithm": "m.megolm.v1.aes-sha2" } }),
+        ] {
+            let body = json!({ "initial_state": [entry] });
+            let err = build_initial_events(
+                &sender,
+                &body,
+                "127.0.0.1",
+                "Alice",
+                &EventPolicy::trusted_network(),
+            )
+            .expect_err("must refuse");
+            assert!(
+                matches!(err, super::CreateRoomError::BadInitialState(_)),
+                "wrong error kind: {err}"
+            );
+        }
     }
 
     #[test]
