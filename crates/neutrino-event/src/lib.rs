@@ -16,7 +16,7 @@ pub use sign::{
     CoSignError, EventPolicy, EventSecurity, EventSigner, KeyResolveError, KeyResolver,
     NodeIdKeyResolver, SIGNING_KEY_ID, VerifyError, verify_event_signature, verify_event_signed_by,
 };
-pub use validate::{FormatError, SemanticVerdict, semantic_verdict};
+pub use validate::{FormatError, MAX_PREV_EVENTS, MAX_PREV_STATE_EVENTS, SemanticVerdict, semantic_verdict};
 
 /// Wire identifier of the **base** room version — the one every build
 /// understands and creates rooms under unless its federation medium declares

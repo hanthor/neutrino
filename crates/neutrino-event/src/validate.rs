@@ -30,8 +30,8 @@ use crate::Event;
 use crate::event_id::canonical;
 use crate::room_version::RoomVersion;
 
-const MAX_PREV_EVENTS: usize = 20;
-const MAX_PREV_STATE_EVENTS: usize = 20;
+pub const MAX_PREV_EVENTS: usize = 20;
+pub const MAX_PREV_STATE_EVENTS: usize = 20;
 /// S-S API §"Size limits": the complete PDU must be ≤ 65536 bytes when
 /// encoded as canonical JSON. Cross-ref synapse `MAX_PDU_SIZE`.
 const MAX_PDU_BYTES: usize = 65536;
