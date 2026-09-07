@@ -12,8 +12,10 @@ use tracing::warn;
 
 use crate::capture::{CaptureControl, Leg, record_response};
 use crate::codec::{cbor_to_json, json_to_cbor};
-use crate::headers::{claimed_origin, is_forwardable};
-use crate::transport::{WireHandler, WireRequest, WireResponse};
+use crate::headers::{
+    CONTENT_TYPE_SENTINEL, claimed_origin, content_type, is_forwardable, is_json_content_type,
+};
+use crate::transport::{OCTET_STREAM_CONTENT_FORMAT, WireHandler, WireRequest, WireResponse};
 
 /// The only path namespace the ingress forwards to the loopback homeserver.
 /// The ingress owns the *public* federation port, but the co-located
@@ -189,6 +191,28 @@ impl WireHandler for IngressHandler {
         // actually returned (a framework error page, say) is the whole
         // diagnostic there, even though it is not forwarded over the wire.
         record_response(&self.capture, exchange, status, &headers, &resp_bytes);
+        // A non-JSON response body — a `multipart/mixed` media download, above
+        // all — cannot be JSON⇄CBOR transcoded. Pass it through byte-for-byte and
+        // carry its real Content-Type on the forwardable sentinel header, so the
+        // recipient's egress restores that type (with its multipart `boundary`)
+        // instead of forcing `application/json`. Keyed off the upstream
+        // Content-Type header, per hop; an `application/json` (or absent) type
+        // stays on the transcode path below.
+        if let Some(ct) = content_type(&headers)
+            .filter(|ct| !is_json_content_type(ct))
+            .map(<[u8]>::to_vec)
+        {
+            let mut headers = headers;
+            headers.push((CONTENT_TYPE_SENTINEL.to_owned(), ct));
+            return WireResponse {
+                status,
+                headers,
+                body: resp_bytes,
+                // Not CBOR: mark the opaque body so a CoAP capture dissects it as
+                // octet-stream rather than mis-parsing it as CBOR.
+                content_format: OCTET_STREAM_CONTENT_FORMAT,
+            };
+        }
         match json_to_cbor(&resp_bytes) {
             Ok(cbor_body) => WireResponse {
                 status,
@@ -312,12 +336,20 @@ mod tests {
         );
     }
 
-    // A non-2xx upstream response whose body is not JSON (e.g. a framework
-    // error page) must keep its status. Masking it as a generic 502 would flip
-    // the homeserver's "drop a 4xx / retry a 5xx" decision into a retry storm.
+    // A non-2xx upstream response that CLAIMS `application/json` but whose body
+    // will not parse must keep its status (the body is dropped). Masking it as a
+    // generic 502 would flip the homeserver's "drop a 4xx / retry a 5xx" decision
+    // into a retry storm. (A non-JSON Content-Type now passes through with its
+    // body intact instead — that is the media path, not this failure path.)
     #[tokio::test]
     async fn preserves_non_2xx_status_when_upstream_body_is_not_json() {
-        let app = Router::new().fallback(|| async { (axum::http::StatusCode::FORBIDDEN, "no") });
+        let app = Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                "no",
+            )
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -338,10 +370,18 @@ mod tests {
         assert!(resp.body.is_empty());
     }
 
-    // A 2xx whose body we cannot transcode is a genuine proxy failure → 502.
+    // A 2xx that CLAIMS `application/json` but whose body will not parse is a
+    // genuine proxy failure → 502. (A non-JSON *Content-Type* is no longer a
+    // failure: it takes the binary-passthrough path — see
+    // `passes_through_non_json_body_with_its_content_type`.)
     #[tokio::test]
     async fn masks_2xx_with_undecodable_body_as_bad_gateway() {
-        let app = Router::new().fallback(|| async { "200 but not json" });
+        let app = Router::new().fallback(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                "200 but not json",
+            )
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -360,6 +400,53 @@ mod tests {
             .await;
 
         assert_eq!(resp.status, 502);
+    }
+
+    // A non-JSON upstream response (a `multipart/mixed` media download) must NOT
+    // be transcoded: its bytes ride through verbatim and its real Content-Type is
+    // carried on the sentinel header for the egress to restore. This is the media
+    // fix — before it, the multipart body failed `json_to_cbor` and 502'd.
+    #[tokio::test]
+    async fn passes_through_non_json_body_with_its_content_type() {
+        let media: Vec<u8> = vec![0x89, 0xff, 0x00, 0xfe, b'X', 0xc0];
+        let ct = "multipart/mixed; boundary=neutrino-abc123";
+        let app = Router::new().fallback({
+            let media = media.clone();
+            move || {
+                let media = media.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, ct)], media) }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let handler = IngressHandler::new(format!("http://{addr}"), None);
+        let resp = handler
+            .handle(WireRequest {
+                dest: String::new(),
+                method: Method::GET,
+                path: "/_matrix/federation/v1/media/download/abc".to_owned(),
+                headers: vec![],
+                body: vec![],
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(resp.status, 200);
+        // Body is the raw media bytes, NOT CBOR of anything.
+        assert_eq!(resp.body, media, "binary body was not passed through verbatim");
+        assert_eq!(resp.content_format, OCTET_STREAM_CONTENT_FORMAT);
+        let sentinel = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(CONTENT_TYPE_SENTINEL))
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            sentinel.as_deref(),
+            Some(ct.as_bytes()),
+            "original Content-Type (with boundary) must ride the sentinel header"
+        );
     }
 
     // A peer must not be able to reach the co-resident Client-Server API

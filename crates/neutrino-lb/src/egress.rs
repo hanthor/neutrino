@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::capture::{CaptureControl, Leg, record_response};
 use crate::codec::{cbor_to_json, json_to_cbor};
-use crate::headers::is_forwardable;
+use crate::headers::{CONTENT_TYPE_SENTINEL, is_forwardable};
 use crate::transport::{DestinationResolver, WireClient, WireRequest};
 
 /// Shared egress state: the wire client used to reach peers, the resolver that
@@ -135,6 +135,30 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
             return error_response(StatusCode::BAD_GATEWAY);
         }
     };
+    // Binary passthrough: an ingress that could not transcode the response
+    // (a `multipart/mixed` media download) stashed the real Content-Type on the
+    // sentinel header. Its presence means the body is opaque — serve it verbatim
+    // under that type, never CBOR-decoded and never forced to `application/json`.
+    if let Some(content_type) = wire_resp
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(CONTENT_TYPE_SENTINEL))
+        .map(|(_, value)| value.clone())
+    {
+        record_response(
+            &state.capture,
+            exchange,
+            wire_resp.status,
+            &wire_resp.headers,
+            &wire_resp.body,
+        );
+        return build_response(
+            wire_resp.status,
+            &wire_resp.headers,
+            wire_resp.body,
+            &content_type,
+        );
+    }
     match cbor_to_json(&wire_resp.body) {
         Ok(json_resp) => {
             record_response(
@@ -144,7 +168,12 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
                 &wire_resp.headers,
                 &json_resp,
             );
-            build_response(wire_resp.status, &wire_resp.headers, json_resp)
+            build_response(
+                wire_resp.status,
+                &wire_resp.headers,
+                json_resp,
+                b"application/json",
+            )
         }
         // A non-2xx whose body we can't decode must keep its status: the
         // homeserver's sender drops a 4xx but retries a 5xx, so masking the
@@ -164,15 +193,30 @@ async fn proxy(State(state): State<EgressState>, req: Request) -> Response {
                 &wire_resp.headers,
                 b"",
             );
-            build_response(wire_resp.status, &wire_resp.headers, Vec::new())
+            build_response(
+                wire_resp.status,
+                &wire_resp.headers,
+                Vec::new(),
+                b"application/json",
+            )
         }
     }
 }
 
-fn build_response(status: u16, headers: &[(String, Vec<u8>)], json_body: Vec<u8>) -> Response {
+/// Build the axum response the loopback homeserver reads back. Forwardable
+/// headers are copied — except the internal [`CONTENT_TYPE_SENTINEL`], which is
+/// consumed here and never leaked upstream — and `content_type` is set as the
+/// `Content-Type` (JSON on the transcode path; the passed-through media type,
+/// with its multipart `boundary`, on the binary-passthrough path).
+fn build_response(
+    status: u16,
+    headers: &[(String, Vec<u8>)],
+    body: Vec<u8>,
+    content_type: &[u8],
+) -> Response {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
-        if !is_forwardable(name) {
+        if !is_forwardable(name) || name.eq_ignore_ascii_case(CONTENT_TYPE_SENTINEL) {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -182,9 +226,11 @@ fn build_response(status: u16, headers: &[(String, Vec<u8>)], json_body: Vec<u8>
             builder = builder.header(n, v);
         }
     }
-    builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Ok(ct) = HeaderValue::from_bytes(content_type) {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+    }
     builder
-        .body(axum::body::Body::from(json_body))
+        .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY))
 }
 
@@ -303,6 +349,76 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
             serde_json::json!({"ping": true})
+        );
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    // A response the ingress marked as binary passthrough (sentinel header set)
+    // must be served to the loopback homeserver verbatim, under the carried
+    // Content-Type — never CBOR-decoded, never forced to `application/json` — and
+    // the internal sentinel must not leak upstream. The egress half of the media
+    // fix; before it, the egress ran `cbor_to_json` on the multipart bytes.
+    #[tokio::test]
+    async fn passes_through_sentinel_marked_body_under_its_content_type() {
+        struct MediaClient;
+        #[async_trait]
+        impl WireClient for MediaClient {
+            async fn send(&self, _req: WireRequest) -> Result<WireResponse, WireError> {
+                Ok(WireResponse {
+                    status: 200,
+                    headers: vec![(
+                        CONTENT_TYPE_SENTINEL.to_owned(),
+                        b"multipart/mixed; boundary=neutrino-xyz".to_vec(),
+                    )],
+                    // Deliberately not valid CBOR and not UTF-8: a no-op passthrough
+                    // is the only way these bytes survive.
+                    body: vec![0x89, 0xff, 0x00, 0xfe, 0x42],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let token = CancellationToken::new();
+        let client_dyn: Arc<dyn WireClient> = Arc::new(MediaClient);
+        let server_token = token.clone();
+        let handle = tokio::spawn(async move {
+            serve(addr, client_dyn, direct(), None, server_token).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        crate::install_crypto_provider();
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+            .build()
+            .unwrap();
+        let resp = http
+            .get("http://peer.example:8448/_matrix/federation/v1/media/download/abc")
+            .send()
+            .await
+            .expect("proxied request");
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("multipart/mixed; boundary=neutrino-xyz"),
+            "carried media Content-Type (with boundary) must be restored"
+        );
+        assert!(
+            resp.headers().get(CONTENT_TYPE_SENTINEL).is_none(),
+            "internal sentinel header must not leak to the homeserver"
+        );
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            &[0x89, 0xff, 0x00, 0xfe, 0x42],
+            "binary media bytes must be served verbatim"
         );
 
         token.cancel();
