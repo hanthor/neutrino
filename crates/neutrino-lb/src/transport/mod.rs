@@ -34,6 +34,11 @@ pub enum WireError {
 /// [`WireRequest`]/[`WireResponse`] `content_format`.
 pub const CBOR_CONTENT_FORMAT: u16 = 60;
 
+/// CoAP content-format for `application/octet-stream`. Tags an opaque
+/// binary-passthrough body (a `multipart/mixed` media download that could not be
+/// transcoded) so a CoAP capture dissects it as bytes, not as malformed CBOR.
+pub const OCTET_STREAM_CONTENT_FORMAT: u16 = 42;
+
 /// A federation request ready for the wire. `body` is already CBOR (empty for a
 /// bodyless GET). `dest` is the peer `server_name` (== host:port for the v1 HTTP
 /// transport); it is unused on the ingress side.

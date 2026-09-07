@@ -116,6 +116,82 @@ async fn start_node(localpart: &str) -> Node {
     }
 }
 
+/// A `multipart/mixed` federation media download (photo/voice attachment) must
+/// survive the `neutrino-lb` sidecars intact. The response body is BINARY, not
+/// JSON, so the JSON⇄CBOR transcode cannot touch it — the sidecar must pass the
+/// bytes through unchanged and carry the `multipart/mixed; boundary=…`
+/// content-type end to end. Before the passthrough fix this 404s: A's ingress
+/// tries to CBOR-encode the multipart body, fails, and returns a 502 that turns
+/// B's federated fetch into `M_NOT_FOUND`.
+#[tokio::test]
+async fn media_download_converges_through_lb_sidecars() {
+    let a = start_node("alice").await;
+    let b = start_node("bob").await;
+
+    // Let both sidecars bind and the servers come up.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    neutrino_lb::install_crypto_provider();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // Raw, deliberately non-UTF8 content (a PNG magic prefix + bytes that are not
+    // valid UTF-8: 0x89, 0xFF, 0xFE, embedded NULs). If any leg assumed UTF-8 or
+    // tried to JSON-parse the body, this would corrupt or fail.
+    let mut media_bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    media_bytes.extend((0..4096u32).map(|i| (i % 256) as u8));
+    media_bytes.extend_from_slice(&[0xff, 0xfe, 0x00, 0x00, 0x80, 0xc0]);
+
+    // 1. Upload the media to A over its CSAPI content-repo endpoint.
+    let upload = http
+        .post(format!("{}/_matrix/media/v3/upload?filename=pic.png", a.http_base))
+        .header(reqwest::header::CONTENT_TYPE, "image/png")
+        .body(media_bytes.clone())
+        .send()
+        .await
+        .expect("upload request");
+    assert_eq!(upload.status(), 200, "upload");
+    let upload_body: Value = upload.json().await.unwrap();
+    let mxc = upload_body["content_uri"].as_str().expect("content_uri");
+    let (server, media_id) = mxc
+        .strip_prefix("mxc://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    assert_eq!(server, a.server_name, "media lives on A");
+
+    // 2. B fetches A's media by mxc server+id. B has it nowhere locally, so its
+    //    homeserver federates the fetch: B-egress → A-ingress, the multipart
+    //    response transcoded (must be: passed-through) back. No room/join needed —
+    //    the peer-fetch fallback fires on any locally-missing media.
+    let download = http
+        .get(format!(
+            "{}/_matrix/client/v1/media/download/{server}/{media_id}",
+            b.http_base
+        ))
+        .send()
+        .await
+        .expect("download request");
+
+    assert_eq!(
+        download.status(),
+        200,
+        "federated media download through the sidecars failed (multipart body did not survive the transcode)"
+    );
+    let ct = download
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(ct, "image/png", "content-type of the delivered media");
+    let got = download.bytes().await.unwrap();
+    assert_eq!(
+        got.as_ref(),
+        media_bytes.as_slice(),
+        "binary media bytes were corrupted crossing the sidecars"
+    );
+}
+
 #[tokio::test]
 async fn message_converges_through_lb_sidecars() {
     let a = start_node("alice").await;
